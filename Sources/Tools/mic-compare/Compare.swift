@@ -8,6 +8,17 @@ import MLXAudioSTT
 import MLXAudioVAD
 import AudioEnhanceKitCore
 import AudioEnhanceKitDFN
+import AudioEnhanceKitDPDFNet
+
+/// Common surface over AudioEnhanceKit's two ANE streaming denoisers so the tap
+/// can use either DeepFilterNet or DPDFNet interchangeably.
+protocol LiveDenoiser: AnyObject {
+    func enqueueInput(_ samples: UnsafePointer<Float>, count: Int) -> Bool
+    func dequeueOutput(into dst: UnsafeMutablePointer<Float>, maxCount: Int) -> Int
+    func stop()
+}
+extension AsyncStreamingDenoiser: LiveDenoiser {}
+extension AsyncDPDFNetEnhancer: LiveDenoiser {}
 
 // Side-by-side live ASR: one mic feeds N providers (local Nemotron/Voxtral +
 // optional cloud DeepGram/Gemini) and their transcripts + metrics are stacked,
@@ -108,12 +119,12 @@ private final class CompareRunner: @unchecked Sendable {
 
     // Live ANE denoise: mic 48k mono -> DeepFilterNet on the Neural Engine ->
     // clean 48k -> downsample to 16k for ASR. GPU stays free for the models.
-    private let denoiser: AsyncStreamingDenoiser?
+    private let denoiser: (any LiveDenoiser)?
     private let cleanConv: AVAudioConverter?  // 48k mono -> 16k mono (clean path)
     private var dnOut = [Float](repeating: 0, count: 16384)
 
     init(providers: [LiveASR], vad: SileroVAD?, feedSamples: Int, inputDevice: AudioDeviceID?,
-         recordURL: URL? = nil, denoiser: AsyncStreamingDenoiser? = nil) {
+         recordURL: URL? = nil, denoiser: (any LiveDenoiser)? = nil) {
         self.providers = providers
         self.vad = vad
         self.feedSamples = feedSamples
@@ -326,6 +337,7 @@ struct MicCompare {
         var dfnRepo: String? = nil
         var tishPath: String? = nil
         var dfnModel = "standard"
+        var denoiserKind = "dfn"   // dfn | dpdfnet
 
         var it = CommandLine.arguments.dropFirst().makeIterator()
         while let a = it.next() {
@@ -349,6 +361,7 @@ struct MicCompare {
             case "--dfn": dfnRepo = it.next()   // local MLX DFN model dir (fallback path)
             case "--tish": tishPath = it.next() // AudioEnhanceKit tish-denoise binary (ANE DFN)
             case "--dfn-model": dfnModel = it.next() ?? dfnModel  // standard|enhanced|v2b|v2b_n4|v2b_n4_4bit
+            case "--denoiser": denoiserKind = (it.next() ?? denoiserKind).lowercased()  // dfn | dpdfnet
             case "--list-devices":
                 let def = AudioDevices.defaultInput()
                 for d in AudioDevices.inputs() { print("\(d.name)\(d.id == def ? " (default)" : "")\n    uid: \(d.uid)") }
@@ -409,12 +422,20 @@ struct MicCompare {
         // Live mic + --denoise: DeepFilterNet on the ANE, streamed in the tap at
         // its native 48 kHz (full benefit, GPU free). (--wav + --denoise uses the
         // offline tish-denoise path above.)
-        var liveDenoiser: AsyncStreamingDenoiser? = nil
+        var liveDenoiser: (any LiveDenoiser)? = nil
         if denoise && wavPath == nil {
-            let variant = ModelVariant(rawValue: dfnModel) ?? .standard
-            FileHandle.standardError.write(Data("starting live ANE denoise (DeepFilterNet '\(variant.rawValue)', 48kHz)...\n".utf8))
-            liveDenoiser = try await AsyncStreamingDenoiser.create(
-                config: .init(variant: variant, backend: .ane, compensateDelay: true, enableProfiling: false))
+            if denoiserKind == "dpdfnet" {
+                let variant: DPDFNetVariant = DPDFNetVariant(rawValue: dfnModel) ?? .dpdfnet2_48khz_hr
+                FileHandle.standardError.write(Data("starting live ANE denoise (DPDFNet '\(variant.rawValue)', 48kHz)...\n".utf8))
+                var cfg = DPDFNetEnhancer.Config(variant: variant)
+                cfg.backend = .ane
+                liveDenoiser = try await AsyncDPDFNetEnhancer.create(config: cfg)
+            } else {
+                let variant = ModelVariant(rawValue: dfnModel) ?? .standard
+                FileHandle.standardError.write(Data("starting live ANE denoise (DeepFilterNet '\(variant.rawValue)', 48kHz)...\n".utf8))
+                liveDenoiser = try await AsyncStreamingDenoiser.create(
+                    config: .init(variant: variant, backend: .ane, compensateDelay: true, enableProfiling: false))
+            }
         }
 
         let runner = CompareRunner(

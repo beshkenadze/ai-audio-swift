@@ -288,7 +288,9 @@ let package = Package(
         ),
         .executableTarget(
             name: "mic-compare",
-            dependencies: ["MLXAudioCore", "MLXAudioSTT", "MLXAudioVAD", "MLXAudioSTS", .product(name: "AudioEnhanceKitDFN", package: "AudioEnhanceKit")],
+            dependencies: ["MLXAudioCore", "MLXAudioSTT", "MLXAudioVAD", "MLXAudioSTS",
+                           .product(name: "AudioEnhanceKitDFN", package: "AudioEnhanceKit"),
+                           .product(name: "AudioEnhanceKitDPDFNet", package: "AudioEnhanceKit")],
             path: "Sources/Tools/mic-compare"
         ),
 
