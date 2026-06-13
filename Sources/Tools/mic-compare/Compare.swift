@@ -336,7 +336,7 @@ struct MicCompare {
             case "--wav": wavPath = it.next()
             case "--record": recordPath = it.next()
             case "--only": onlyArg = it.next()  // comma list: nemotron,voxtral,deepgram,gemini
-            case "--denoise": denoise = true    // DeepFilterNet clean-up (--wav mode)
+            case "--denoise": denoise = true    // ANE denoise (mic + --wav, same path)
             case "--dfn-model": dfnModel = it.next() ?? dfnModel  // standard|enhanced|v2b|v2b_n4|v2b_n4_4bit
             case "--denoiser": denoiserKind = (it.next() ?? denoiserKind).lowercased()  // dfn | dpdfnet
             case "--list-devices":
@@ -345,6 +345,11 @@ struct MicCompare {
                 return
             default: fatalError("unknown arg \(a)")
             }
+        }
+
+        // Fail fast on a bad --wav path before paying for model + denoiser load.
+        if let wavPath, !FileManager.default.fileExists(atPath: wavPath) {
+            FileHandle.standardError.write(Data("--wav file not found: \(wavPath)\n".utf8)); exit(1)
         }
 
         var inputDevice: AudioDeviceID? = nil
@@ -396,9 +401,8 @@ struct MicCompare {
         }
         guard !providers.isEmpty else { FileHandle.standardError.write(Data("no providers selected (check --only / --cloud)\n".utf8)); exit(1) }
 
-        // Live mic + --denoise: DeepFilterNet on the ANE, streamed in the tap at
-        // its native 48 kHz (full benefit, GPU free). (--wav + --denoise uses the
-        // offline tish-denoise path above.)
+        // --denoise: ANE denoiser streamed at native 48 kHz (GPU stays free).
+        // Mic and --wav share this one path — the file just emulates the mic.
         func makeDenoiser() async throws -> any LiveDenoiser {
             if denoiserKind == "dpdfnet" {
                 let variant = DPDFNetVariant(rawValue: dfnModel) ?? .dpdfnet2_48khz_hr
@@ -422,9 +426,14 @@ struct MicCompare {
         if let wavPath {
             // Emulate the mic: load at 48k mono and stream through the SAME single
             // path (denoise included) at real-time pace — deterministic, both
-            // denoisers, no separate offline code.
-            let (_, raw) = try loadAudioArray(from: URL(fileURLWithPath: wavPath), sampleRate: 48000)
-            let mono48 = (raw.ndim > 1 ? raw.mean(axis: -1) : raw).asType(.float32).asArray(Float.self)
+            // denoisers, no separate offline code. (Existence checked up front.)
+            let mono48: [Float]
+            do {
+                let (_, raw) = try loadAudioArray(from: URL(fileURLWithPath: wavPath), sampleRate: 48000)
+                mono48 = (raw.ndim > 1 ? raw.mean(axis: -1) : raw).asType(.float32).asArray(Float.self)
+            } catch {
+                FileHandle.standardError.write(Data("--wav could not decode \(wavPath): \(error)\n".utf8)); exit(1)
+            }
             try runner.start(mic: false)
             FileHandle.standardError.write(Data(
                 "feeding \(wavPath) (\(String(format: "%.1f", Double(mono48.count) / 48000))s @48k)\(denoise ? " through ANE denoise" : "") at real-time pace...\n".utf8))
