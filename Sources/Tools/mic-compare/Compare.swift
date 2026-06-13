@@ -20,10 +20,14 @@ private struct Stats {
     var chunks = 0
     var lastStepMs = 0.0
     var stepMsTotal = 0.0
-    var audioSamples = 0
+    var audioSamples = 0      // audio actually fed to the model
+    var skippedSamples = 0    // audio the VAD gate dropped (still advances the timeline)
     var firstTextDelay = -1.0
     var label = ""
     var transcript = ""
+    // Stream timeline (fed + gate-skipped) in seconds; used for honest lag so a
+    // gated model isn't charged for the silence it never processed.
+    var timelineS: Double { Double(audioSamples + skippedSamples) / 16000.0 }
 }
 
 /// Full-screen two-block HUD, redrawn in place (no-op when stdout isn't a TTY).
@@ -67,9 +71,9 @@ private struct HUD {
             let audioS = Double(s.audioSamples) / 16000.0
             let avg = s.chunks > 0 ? s.stepMsTotal / Double(s.chunks) : 0
             let rtf = audioS > 0 ? (s.stepMsTotal / 1000) / audioS : 0
-            let lag = max(0, wall - audioS)
+            let lag = max(0, wall - s.timelineS)
             let ttft = s.firstTextDelay >= 0 ? String(format: "%.2fs", s.firstTextDelay) : "—"
-            let lagStr = s.chunks > 0 ? String(format: "%.2fs", lag) : "—"
+            let lagStr = s.timelineS > 0 ? String(format: "%.2fs", lag) : "—"
             let words = s.transcript.split(whereSeparator: \.isWhitespace).count
             let head = String(
                 format: " %@  lag %@ · words %d · step %.0f/%.0fms · RTF %.2f · TTFT %@",
@@ -182,7 +186,7 @@ private final class CompareRunner: @unchecked Sendable {
             let rtf = audioS > 0 ? (s.stepMsTotal / 1000) / audioS : 0
             let wall = CFAbsoluteTimeGetCurrent() - startTime
             let ttft = s.firstTextDelay >= 0 ? String(format: "%.2fs", s.firstTextDelay) : "—"
-            return (s.transcript.split(whereSeparator: \.isWhitespace).count, avg, rtf, ttft, max(0, wall - audioS))
+            return (s.transcript.split(whereSeparator: \.isWhitespace).count, avg, rtf, ttft, max(0, wall - s.timelineS))
         }
         let n = metrics(nemoStats), v = metrics(voxStats)
         let audioS = Double(nemoStats.audioSamples) / 16000.0
@@ -196,8 +200,8 @@ private final class CompareRunner: @unchecked Sendable {
         out += row("avg step", String(format: "%.0fms", n.avg), String(format: "%.0fms", v.avg)) + "\n"
         out += row("RTF", String(format: "%.2f", n.rtf), String(format: "%.2f", v.rtf)) + "\n"
         out += row("TTFT", n.ttft, v.ttft) + "\n"
-        let nLag = nemoStats.chunks > 0 ? String(format: "%.2fs", n.lag) : "—"
-        let vLag = voxStats.chunks > 0 ? String(format: "%.2fs", v.lag) : "—"
+        let nLag = nemoStats.timelineS > 0 ? String(format: "%.2fs", n.lag) : "—"
+        let vLag = voxStats.timelineS > 0 ? String(format: "%.2fs", v.lag) : "—"
         out += row("lag", nLag, vLag) + "\n"
         out += "───────────────────────────────────────────────────────\n"
         out += "NEMOTRON: \(nemoStats.transcript)\n\nVOXTRAL:  \(voxStats.transcript)\n"
@@ -263,8 +267,9 @@ private final class CompareRunner: @unchecked Sendable {
         }
 
         // Voxtral: gated by VAD when enabled — silence chunks are skipped so it
-        // never sees (and hallucinates on) non-speech.
-        guard vad == nil || speechActive else { return }
+        // never sees (and hallucinates on) non-speech. Skipped audio still advances
+        // the timeline so lag reflects speech-processing delay, not paused silence.
+        guard vad == nil || speechActive else { voxStats.skippedSamples += chunk.count; return }
         t = CFAbsoluteTimeGetCurrent()
         let vd = vox.step(chunk)
         voxStats.lastStepMs = (CFAbsoluteTimeGetCurrent() - t) * 1000
