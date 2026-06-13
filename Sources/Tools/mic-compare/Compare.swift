@@ -98,19 +98,34 @@ private final class CompareRunner: @unchecked Sendable {
         self.converter = conv
     }
 
-    func start() throws {
+    func start(mic: Bool = true) throws {
         startTime = CFAbsoluteTimeGetCurrent()
         hud.begin()
-        engine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: inFmt) { [self] buf, _ in
-            let f = convert(buf); if !f.isEmpty { feed(f) }
+        if mic {
+            engine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: inFmt) { [self] buf, _ in
+                let f = convert(buf); if !f.isEmpty { feed(f) }
+            }
+            engine.prepare(); try engine.start()
         }
-        engine.prepare(); try engine.start()
         let t = DispatchSource.makeTimerSource(queue: queue)
         t.schedule(deadline: .now() + 0.2, repeating: 0.2)
         t.setEventHandler { [self] in
             hud.render(providers.map { $0.snapshot() }, vad: (on: vad != nil, active: speechActive, prob: lastVadProb))
         }
         t.resume(); ticker = t
+    }
+
+    /// Drive from a 16 kHz mono file at real-time pace (no mic) — for verifying
+    /// providers (incl. cloud) on a known clip without speaking.
+    func feedFileRealtime(_ samples: [Float]) {
+        let cs = feedSamples
+        var i = 0
+        while i < samples.count {
+            let e = min(i + cs, samples.count)
+            feed(Array(samples[i..<e]))
+            i = e
+            Thread.sleep(forTimeInterval: Double(cs) / 16000.0)  // ~real-time pacing
+        }
     }
 
     func stop() {
@@ -205,8 +220,9 @@ struct MicCompare {
         var useVad = false
         var vadRepo = "mlx-community/silero-vad"
         var cloud = false
-        var geminiModel = "gemini-2.5-flash-native-audio"
+        var geminiModel = "gemini-2.5-flash-native-audio-latest"
         var dgModel = "nova-2"
+        var wavPath: String? = nil
 
         var it = CommandLine.arguments.dropFirst().makeIterator()
         while let a = it.next() {
@@ -223,6 +239,7 @@ struct MicCompare {
             case "--cloud": cloud = true
             case "--gemini-model": geminiModel = it.next() ?? geminiModel
             case "--dg-model": dgModel = it.next() ?? dgModel
+            case "--wav": wavPath = it.next()
             case "--list-devices":
                 let def = AudioDevices.defaultInput()
                 for d in AudioDevices.inputs() { print("\(d.name)\(d.id == def ? " (default)" : "")\n    uid: \(d.uid)") }
@@ -283,6 +300,17 @@ struct MicCompare {
         let runner = CompareRunner(
             providers: providers, vad: vad,
             feedSamples: max(1, 16000 * feedMs / 1000), inputDevice: inputDevice)
+
+        if let wavPath {
+            let (sr, raw) = try loadAudioArray(from: URL(fileURLWithPath: wavPath), sampleRate: 16000)
+            precondition(sr == 16000, "expected 16k, got \(sr)")
+            let samples = (raw.ndim > 1 ? raw.mean(axis: -1) : raw).asType(.float32).asArray(Float.self)
+            try runner.start(mic: false)
+            FileHandle.standardError.write(Data("feeding \(wavPath) (\(String(format: "%.1f", Double(samples.count) / 16000))s) at real-time pace...\n".utf8))
+            runner.feedFileRealtime(samples)
+            runner.stop()
+            return
+        }
 
         try runner.start()
         FileHandle.standardError.write(Data((seconds == nil ? "READY: speak now (Enter to stop)\n" : "READY: speak now (\(Int(seconds!)) s)\n").utf8))

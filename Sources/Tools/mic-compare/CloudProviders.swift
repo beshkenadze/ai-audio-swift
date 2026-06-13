@@ -1,5 +1,16 @@
 import Foundation
 
+private extension Data {
+    func append(to url: URL) throws {
+        if let h = try? FileHandle(forWritingTo: url) {
+            defer { try? h.close() }
+            try h.seekToEnd(); h.write(self)
+        } else {
+            try write(to: url)
+        }
+    }
+}
+
 // Cloud streaming ASR over WebSockets. Both consume the same 16 kHz mono Int16
 // PCM the local pipeline produces. Keys come from .env (see Env.swift).
 //
@@ -123,7 +134,7 @@ final class GeminiASR: LiveASR {
             ],
         ]
         if let d = try? JSONSerialization.data(withJSONObject: setup), let s = String(data: d, encoding: .utf8) {
-            t.send(.string(s)) { _ in }
+            t.send(.string(s)) { [weak self] err in if let err { self?.dbg("SETUP SEND ERR: \(err)") } else { self?.dbg("SETUP SENT: \(s)") } }
         }
         receive()
     }
@@ -138,16 +149,22 @@ final class GeminiASR: LiveASR {
         }
     }
 
+    private func dbg(_ s: String) {
+        guard ProcessInfo.processInfo.environment["GEMINI_DEBUG"] != nil else { return }
+        try? (s + "\n").data(using: .utf8)?.append(to: URL(fileURLWithPath: "/tmp/gemini-raw.jsonl"))
+    }
+
     private func receive() {
         task?.receive { [weak self] result in
             guard let self else { return }
             switch result {
-            case .failure:
+            case .failure(let e):
+                self.dbg("FAILURE: \(e)")
                 self.lock.lock(); self.snap.note = "cloud · disconnected"; self.lock.unlock()
             case .success(let msg):
                 switch msg {
                 case .string(let s): self.handle(s)
-                case .data(let d): if let s = String(data: d, encoding: .utf8) { self.handle(s) }
+                case .data(let d): self.handle(String(data: d, encoding: .utf8) ?? "<\(d.count) bytes binary>")
                 @unknown default: break
                 }
                 self.receive()
@@ -156,6 +173,7 @@ final class GeminiASR: LiveASR {
     }
 
     private func handle(_ s: String) {
+        dbg(s)
         guard let data = s.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
         lock.lock()
