@@ -389,6 +389,23 @@ struct MicCompare {
             providers.append(LocalASR(label: "VOXTRAL 4B \(quant(voxRepo)) (480ms)",
                                       gated: vad != nil, step: { s.step($0); return s.text }, finish: { _ = s.finish(); return s.text }))
         }
+        if wanted("apple") {
+            if #available(macOS 26.0, iOS 26.0, *) {
+                let loc: String = {
+                    switch (language ?? "en").lowercased() {
+                    case "ru": return "ru_RU"
+                    case "en": return "en_US"
+                    case let l where l.contains("_"): return l
+                    case let l: return "\(l)_\(l.uppercased())"
+                    }
+                }()
+                FileHandle.standardError.write(Data("loading Apple SpeechAnalyzer (\(loc), reference)...\n".utf8))
+                do { providers.append(try await SpeechAnalyzerASR.create(locale: loc)) }
+                catch { FileHandle.standardError.write(Data("(Apple SpeechAnalyzer unavailable: \(error) — skipping)\n".utf8)) }
+            } else {
+                FileHandle.standardError.write(Data("(SpeechAnalyzer needs macOS 26+ — skipping apple)\n".utf8))
+            }
+        }
         if cloud {
             if wanted("deepgram") {
                 if let key = Env.value("DEEPGRAM_API_KEY") { providers.append(DeepgramASR(key: key, language: language ?? "ru", model: dgModel)) }
