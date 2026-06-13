@@ -61,6 +61,10 @@ let package = Package(
             name: "nemo-mic",
             targets: ["nemo-mic"],
         ),
+        .executable(
+            name: "mic-compare",
+            targets: ["mic-compare"],
+        ),
 
     ],
     dependencies: [
@@ -280,6 +284,11 @@ let package = Package(
             name: "nemo-mic",
             dependencies: ["MLXAudioCore", "MLXAudioSTT"],
             path: "Sources/Tools/nemo-mic"
+        ),
+        .executableTarget(
+            name: "mic-compare",
+            dependencies: ["MLXAudioCore", "MLXAudioSTT"],
+            path: "Sources/Tools/mic-compare"
         ),
 
         // MARK: - Tests
