@@ -57,6 +57,10 @@ let package = Package(
             name: "mlx-audio-swift-lid",
             targets: ["mlx-audio-swift-lid"],
         ),
+        .executable(
+            name: "nemo-mic",
+            targets: ["nemo-mic"],
+        ),
 
     ],
     dependencies: [
@@ -271,6 +275,11 @@ let package = Package(
             exclude: [
                 "README.md",
             ]
+        ),
+        .executableTarget(
+            name: "nemo-mic",
+            dependencies: ["MLXAudioCore", "MLXAudioSTT"],
+            path: "Sources/Tools/nemo-mic"
         ),
 
         // MARK: - Tests
