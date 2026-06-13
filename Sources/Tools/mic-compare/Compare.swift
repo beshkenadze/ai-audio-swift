@@ -82,10 +82,14 @@ private final class CompareRunner: @unchecked Sendable {
     private let hud = HUD()
     private var ticker: DispatchSourceTimer?
 
-    init(providers: [LiveASR], vad: SileroVAD?, feedSamples: Int, inputDevice: AudioDeviceID?) {
+    private let recordURL: URL?
+    private var recordBuffer: [Float] = []
+
+    init(providers: [LiveASR], vad: SileroVAD?, feedSamples: Int, inputDevice: AudioDeviceID?, recordURL: URL? = nil) {
         self.providers = providers
         self.vad = vad
         self.feedSamples = feedSamples
+        self.recordURL = recordURL
         if let dev = inputDevice ?? AudioDevices.defaultInput() {
             try? AudioDevices.setInput(dev, on: engine)
             let f = engine.inputNode.outputFormat(forBus: 0)
@@ -139,7 +143,29 @@ private final class CompareRunner: @unchecked Sendable {
         Thread.sleep(forTimeInterval: 0.6)
         hud.render(providers.map { $0.snapshot() }, vad: (on: vad != nil, active: speechActive, prob: lastVadProb))
         hud.end()
+        if let recordURL {
+            Self.writeWav16k(recordBuffer, to: recordURL)
+            FileHandle.standardError.write(Data("recorded \(String(format: "%.1f", Double(recordBuffer.count) / 16000))s -> \(recordURL.path) (replay with --wav)\n".utf8))
+        }
         printSummary()
+    }
+
+    /// Write 16 kHz mono Int16 WAV (the exact audio fed to the providers).
+    private static func writeWav16k(_ samples: [Float], to url: URL) {
+        let sr: UInt32 = 16000, ch: UInt16 = 1, bits: UInt16 = 16
+        let dataSize = UInt32(samples.count * 2)
+        var d = Data()
+        func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+        func u16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+        d.append("RIFF".data(using: .ascii)!); u32(36 + dataSize); d.append("WAVE".data(using: .ascii)!)
+        d.append("fmt ".data(using: .ascii)!); u32(16); u16(1); u16(ch); u32(sr)
+        u32(sr * UInt32(ch) * UInt32(bits) / 8); u16(ch * bits / 8); u16(bits)
+        d.append("data".data(using: .ascii)!); u32(dataSize)
+        for s in samples {
+            let v = Int16(max(-32767, min(32767, (s * 32767).rounded())))
+            withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) }
+        }
+        try? d.write(to: url)
     }
 
     private func convert(_ buffer: AVAudioPCMBuffer) -> [Float] {
@@ -178,6 +204,7 @@ private final class CompareRunner: @unchecked Sendable {
 
     private func emitFrame(_ chunk: [Float]) {
         totalSamples += chunk.count
+        if recordURL != nil { recordBuffer.append(contentsOf: chunk) }
         let frame = AudioFrame(
             samples: chunk, pcm16le: Self.pcm16le(chunk), speechActive: speechActive,
             wallNow: CFAbsoluteTimeGetCurrent() - startTime, audioEndS: Double(totalSamples) / 16000.0)
@@ -223,6 +250,8 @@ struct MicCompare {
         var geminiModel = "gemini-2.5-flash-native-audio-latest"
         var dgModel = "nova-2"
         var wavPath: String? = nil
+        var recordPath: String? = nil
+        var onlyArg: String? = nil
 
         var it = CommandLine.arguments.dropFirst().makeIterator()
         while let a = it.next() {
@@ -240,6 +269,8 @@ struct MicCompare {
             case "--gemini-model": geminiModel = it.next() ?? geminiModel
             case "--dg-model": dgModel = it.next() ?? dgModel
             case "--wav": wavPath = it.next()
+            case "--record": recordPath = it.next()
+            case "--only": onlyArg = it.next()  // comma list: nemotron,voxtral,deepgram,gemini
             case "--list-devices":
                 let def = AudioDevices.defaultInput()
                 for d in AudioDevices.inputs() { print("\(d.name)\(d.id == def ? " (default)" : "")\n    uid: \(d.uid)") }
@@ -261,45 +292,46 @@ struct MicCompare {
             return "?"
         }
 
-        FileHandle.standardError.write(Data("loading models\(useVad ? " + silero-vad" : "")\(cloud ? " + cloud" : "")...\n".utf8))
-        let nemoModel = try await NemotronASRModel.fromPretrained(nemoRepo)
-        let voxModel = try await VoxtralRealtimeModel.fromPretrained(voxRepo)
+        // Which engines to run (default all). Lets you isolate, e.g. one local vs
+        // cloud, so the GPU-bound local models don't contend with each other.
+        let want: Set<String>? = onlyArg.map { Set($0.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }) }
+        func wanted(_ n: String) -> Bool { want == nil || want!.contains(n) }
+
         let vad = useVad ? try await SileroVAD.fromPretrained(vadRepo) : nil
+        var providers: [LiveASR] = []
 
-        // Warm Metal kernels so the first live chunks aren't cold.
-        let wn = nemoModel.makeStreamSession(language: language, chunkMs: chunkMs); _ = wn.step([Float](repeating: 0, count: 16000 * 2)); _ = wn.finish()
-        let wv = voxModel.makeStreamSession(); _ = wv.step([Float](repeating: 0, count: 16000 * 2)); _ = wv.finish()
-
-        let nemoSession = nemoModel.makeStreamSession(language: language, chunkMs: chunkMs)
-        let voxSession = voxModel.makeStreamSession()
-
-        var providers: [LiveASR] = [
-            LocalASR(label: "NEMOTRON 0.6b \(quant(nemoRepo)) (\(chunkMs.map { "\($0)ms" } ?? "native"))",
-                     gated: false,
-                     step: { nemoSession.step($0); return nemoSession.text },
-                     finish: { _ = nemoSession.finish(); return nemoSession.text }),
-            LocalASR(label: "VOXTRAL 4B \(quant(voxRepo)) (480ms)",
-                     gated: vad != nil,
-                     step: { voxSession.step($0); return voxSession.text },
-                     finish: { _ = voxSession.finish(); return voxSession.text }),
-        ]
-
+        if wanted("nemotron") {
+            FileHandle.standardError.write(Data("loading nemotron...\n".utf8))
+            let m = try await NemotronASRModel.fromPretrained(nemoRepo)
+            let w = m.makeStreamSession(language: language, chunkMs: chunkMs); _ = w.step([Float](repeating: 0, count: 16000 * 2)); _ = w.finish()
+            let s = m.makeStreamSession(language: language, chunkMs: chunkMs)
+            providers.append(LocalASR(label: "NEMOTRON 0.6b \(quant(nemoRepo)) (\(chunkMs.map { "\($0)ms" } ?? "native"))",
+                                      gated: false, step: { s.step($0); return s.text }, finish: { _ = s.finish(); return s.text }))
+        }
+        if wanted("voxtral") {
+            FileHandle.standardError.write(Data("loading voxtral...\n".utf8))
+            let m = try await VoxtralRealtimeModel.fromPretrained(voxRepo)
+            let w = m.makeStreamSession(); _ = w.step([Float](repeating: 0, count: 16000 * 2)); _ = w.finish()
+            let s = m.makeStreamSession()
+            providers.append(LocalASR(label: "VOXTRAL 4B \(quant(voxRepo)) (480ms)",
+                                      gated: vad != nil, step: { s.step($0); return s.text }, finish: { _ = s.finish(); return s.text }))
+        }
         if cloud {
-            if let key = Env.value("DEEPGRAM_API_KEY") {
-                providers.append(DeepgramASR(key: key, language: language ?? "ru", model: dgModel))
-            } else {
-                FileHandle.standardError.write(Data("(no DEEPGRAM_API_KEY in .env — skipping DeepGram)\n".utf8))
+            if wanted("deepgram") {
+                if let key = Env.value("DEEPGRAM_API_KEY") { providers.append(DeepgramASR(key: key, language: language ?? "ru", model: dgModel)) }
+                else { FileHandle.standardError.write(Data("(no DEEPGRAM_API_KEY in .env — skipping DeepGram)\n".utf8)) }
             }
-            if let key = Env.value("GEMINI_API_KEY") {
-                providers.append(GeminiASR(key: key, model: geminiModel))
-            } else {
-                FileHandle.standardError.write(Data("(no GEMINI_API_KEY in .env — skipping Gemini)\n".utf8))
+            if wanted("gemini") {
+                if let key = Env.value("GEMINI_API_KEY") { providers.append(GeminiASR(key: key, model: geminiModel)) }
+                else { FileHandle.standardError.write(Data("(no GEMINI_API_KEY in .env — skipping Gemini)\n".utf8)) }
             }
         }
+        guard !providers.isEmpty else { FileHandle.standardError.write(Data("no providers selected (check --only / --cloud)\n".utf8)); exit(1) }
 
         let runner = CompareRunner(
             providers: providers, vad: vad,
-            feedSamples: max(1, 16000 * feedMs / 1000), inputDevice: inputDevice)
+            feedSamples: max(1, 16000 * feedMs / 1000), inputDevice: inputDevice,
+            recordURL: recordPath.map { URL(fileURLWithPath: $0) })
 
         if let wavPath {
             let (sr, raw) = try loadAudioArray(from: URL(fileURLWithPath: wavPath), sampleRate: 16000)
