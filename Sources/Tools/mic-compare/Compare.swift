@@ -3,6 +3,7 @@ import Darwin
 import Foundation
 import MLX
 import MLXAudioCore
+import MLXAudioSTS
 import MLXAudioSTT
 import MLXAudioVAD
 
@@ -11,6 +12,24 @@ import MLXAudioVAD
 // redrawn in place. See which engine reads your speech best, live.
 
 private final class Flag: @unchecked Sendable { var done = false }
+
+/// Write mono Int16 WAV.
+private func writeWavMono(_ samples: [Float], sampleRate: Int, to url: URL) {
+    let sr = UInt32(sampleRate); let ch: UInt16 = 1; let bits: UInt16 = 16
+    let dataSize = UInt32(samples.count * 2)
+    var d = Data()
+    func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+    func u16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+    d.append("RIFF".data(using: .ascii)!); u32(36 + dataSize); d.append("WAVE".data(using: .ascii)!)
+    d.append("fmt ".data(using: .ascii)!); u32(16); u16(1); u16(ch); u32(sr)
+    u32(sr * UInt32(ch) * UInt32(bits) / 8); u16(ch * bits / 8); u16(bits)
+    d.append("data".data(using: .ascii)!); u32(dataSize)
+    for s in samples {
+        let v = Int16(max(-32767, min(32767, (s * 32767).rounded())))
+        withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) }
+    }
+    try? d.write(to: url)
+}
 
 /// Full-screen N-block HUD, redrawn in place (no-op when stdout isn't a TTY).
 private struct HUD {
@@ -144,28 +163,10 @@ private final class CompareRunner: @unchecked Sendable {
         hud.render(providers.map { $0.snapshot() }, vad: (on: vad != nil, active: speechActive, prob: lastVadProb))
         hud.end()
         if let recordURL {
-            Self.writeWav16k(recordBuffer, to: recordURL)
+            writeWavMono(recordBuffer, sampleRate: 16000, to: recordURL)
             FileHandle.standardError.write(Data("recorded \(String(format: "%.1f", Double(recordBuffer.count) / 16000))s -> \(recordURL.path) (replay with --wav)\n".utf8))
         }
         printSummary()
-    }
-
-    /// Write 16 kHz mono Int16 WAV (the exact audio fed to the providers).
-    private static func writeWav16k(_ samples: [Float], to url: URL) {
-        let sr: UInt32 = 16000, ch: UInt16 = 1, bits: UInt16 = 16
-        let dataSize = UInt32(samples.count * 2)
-        var d = Data()
-        func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
-        func u16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
-        d.append("RIFF".data(using: .ascii)!); u32(36 + dataSize); d.append("WAVE".data(using: .ascii)!)
-        d.append("fmt ".data(using: .ascii)!); u32(16); u16(1); u16(ch); u32(sr)
-        u32(sr * UInt32(ch) * UInt32(bits) / 8); u16(ch * bits / 8); u16(bits)
-        d.append("data".data(using: .ascii)!); u32(dataSize)
-        for s in samples {
-            let v = Int16(max(-32767, min(32767, (s * 32767).rounded())))
-            withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) }
-        }
-        try? d.write(to: url)
     }
 
     private func convert(_ buffer: AVAudioPCMBuffer) -> [Float] {
@@ -234,6 +235,13 @@ private final class CompareRunner: @unchecked Sendable {
 
 @main
 struct MicCompare {
+    /// Latest local snapshot dir of the DFN repo in the hf cache, if present.
+    static func dfnSnapshotDir() -> String? {
+        let base = NSHomeDirectory() + "/.cache/huggingface/hub/models--mlx-community--DeepFilterNet-mlx/snapshots"
+        guard let snaps = try? FileManager.default.contentsOfDirectory(atPath: base), !snaps.isEmpty else { return nil }
+        return base + "/" + snaps.sorted().last!
+    }
+
     static func main() async throws {
         GPU.set(memoryLimit: 18 * 1024 * 1024 * 1024, relaxed: false)
 
@@ -252,6 +260,8 @@ struct MicCompare {
         var wavPath: String? = nil
         var recordPath: String? = nil
         var onlyArg: String? = nil
+        var denoise = false
+        var dfnRepo: String? = nil
 
         var it = CommandLine.arguments.dropFirst().makeIterator()
         while let a = it.next() {
@@ -271,6 +281,8 @@ struct MicCompare {
             case "--wav": wavPath = it.next()
             case "--record": recordPath = it.next()
             case "--only": onlyArg = it.next()  // comma list: nemotron,voxtral,deepgram,gemini
+            case "--denoise": denoise = true    // DeepFilterNet clean-up (--wav mode, offline/MLX)
+            case "--dfn": dfnRepo = it.next()   // local DFN model dir (override auto-resolve)
             case "--list-devices":
                 let def = AudioDevices.defaultInput()
                 for d in AudioDevices.inputs() { print("\(d.name)\(d.id == def ? " (default)" : "")\n    uid: \(d.uid)") }
@@ -334,9 +346,35 @@ struct MicCompare {
             recordURL: recordPath.map { URL(fileURLWithPath: $0) })
 
         if let wavPath {
-            let (sr, raw) = try loadAudioArray(from: URL(fileURLWithPath: wavPath), sampleRate: 16000)
-            precondition(sr == 16000, "expected 16k, got \(sr)")
-            let samples = (raw.ndim > 1 ? raw.mean(axis: -1) : raw).asType(.float32).asArray(Float.self)
+            let samples: [Float]
+            if denoise {
+                // DeepFilterNet runs at 48 kHz. Enhance offline (one-time, no live
+                // contention), then downsample the clean audio to 16 k for ASR and
+                // save it so you can hear the cleanup. (MLX/GPU — ANE would need a
+                // CoreML DFN export, which doesn't exist yet.)
+                FileHandle.standardError.write(Data("loading DeepFilterNet (DFN v3)...\n".utf8))
+                // The DFN repo ships v1/v2/v3 subfolders, which trips the Swift
+                // auto-downloader's completeness check. Pass the hf-cache snapshot
+                // dir + subfolder "v3" directly (download once: `hf download
+                // mlx-community/DeepFilterNet-mlx`).
+                let dfn: DeepFilterNetModel
+                if let local = dfnRepo ?? Self.dfnSnapshotDir() {
+                    dfn = try await DeepFilterNetModel.fromPretrained(local, subfolder: "v3")
+                } else {
+                    dfn = try await DeepFilterNetModel.fromPretrained()
+                }
+                let (_, raw48) = try loadAudioArray(from: URL(fileURLWithPath: wavPath), sampleRate: 48000)
+                let mono48 = (raw48.ndim > 1 ? raw48.mean(axis: -1) : raw48).asType(.float32)
+                let clean48f = try dfn.enhance(mono48).reshaped([-1]).asArray(Float.self)
+                let outURL = URL(fileURLWithPath: wavPath).deletingPathExtension().appendingPathExtension("denoised.wav")
+                writeWavMono(clean48f, sampleRate: 48000, to: outURL)
+                samples = try resampleAudio(clean48f, from: 48000, to: 16000)
+                FileHandle.standardError.write(Data("denoised -> \(outURL.path) (listen) ; feeding cleaned audio\n".utf8))
+            } else {
+                let (sr, raw) = try loadAudioArray(from: URL(fileURLWithPath: wavPath), sampleRate: 16000)
+                precondition(sr == 16000, "expected 16k, got \(sr)")
+                samples = (raw.ndim > 1 ? raw.mean(axis: -1) : raw).asType(.float32).asArray(Float.self)
+            }
             try runner.start(mic: false)
             FileHandle.standardError.write(Data("feeding \(wavPath) (\(String(format: "%.1f", Double(samples.count) / 16000))s) at real-time pace...\n".utf8))
             runner.feedFileRealtime(samples)

@@ -287,7 +287,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "mic-compare",
-            dependencies: ["MLXAudioCore", "MLXAudioSTT", "MLXAudioVAD"],
+            dependencies: ["MLXAudioCore", "MLXAudioSTT", "MLXAudioVAD", "MLXAudioSTS"],
             path: "Sources/Tools/mic-compare"
         ),
 
