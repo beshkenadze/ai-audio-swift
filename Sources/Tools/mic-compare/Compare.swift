@@ -262,6 +262,8 @@ struct MicCompare {
         var onlyArg: String? = nil
         var denoise = false
         var dfnRepo: String? = nil
+        var tishPath: String? = nil
+        var dfnModel = "standard"
 
         var it = CommandLine.arguments.dropFirst().makeIterator()
         while let a = it.next() {
@@ -281,8 +283,10 @@ struct MicCompare {
             case "--wav": wavPath = it.next()
             case "--record": recordPath = it.next()
             case "--only": onlyArg = it.next()  // comma list: nemotron,voxtral,deepgram,gemini
-            case "--denoise": denoise = true    // DeepFilterNet clean-up (--wav mode, offline/MLX)
-            case "--dfn": dfnRepo = it.next()   // local DFN model dir (override auto-resolve)
+            case "--denoise": denoise = true    // DeepFilterNet clean-up (--wav mode)
+            case "--dfn": dfnRepo = it.next()   // local MLX DFN model dir (fallback path)
+            case "--tish": tishPath = it.next() // AudioEnhanceKit tish-denoise binary (ANE DFN)
+            case "--dfn-model": dfnModel = it.next() ?? dfnModel  // standard|enhanced|v2b|v2b_n4|v2b_n4_4bit
             case "--list-devices":
                 let def = AudioDevices.defaultInput()
                 for d in AudioDevices.inputs() { print("\(d.name)\(d.id == def ? " (default)" : "")\n    uid: \(d.uid)") }
@@ -348,28 +352,46 @@ struct MicCompare {
         if let wavPath {
             let samples: [Float]
             if denoise {
-                // DeepFilterNet runs at 48 kHz. Enhance offline (one-time, no live
-                // contention), then downsample the clean audio to 16 k for ASR and
-                // save it so you can hear the cleanup. (MLX/GPU — ANE would need a
-                // CoreML DFN export, which doesn't exist yet.)
-                FileHandle.standardError.write(Data("loading DeepFilterNet (DFN v3)...\n".utf8))
-                // The DFN repo ships v1/v2/v3 subfolders, which trips the Swift
-                // auto-downloader's completeness check. Pass the hf-cache snapshot
-                // dir + subfolder "v3" directly (download once: `hf download
-                // mlx-community/DeepFilterNet-mlx`).
-                let dfn: DeepFilterNetModel
-                if let local = dfnRepo ?? Self.dfnSnapshotDir() {
-                    dfn = try await DeepFilterNetModel.fromPretrained(local, subfolder: "v3")
-                } else {
-                    dfn = try await DeepFilterNetModel.fromPretrained()
-                }
-                let (_, raw48) = try loadAudioArray(from: URL(fileURLWithPath: wavPath), sampleRate: 48000)
-                let mono48 = (raw48.ndim > 1 ? raw48.mean(axis: -1) : raw48).asType(.float32)
-                let clean48f = try dfn.enhance(mono48).reshaped([-1]).asArray(Float.self)
                 let outURL = URL(fileURLWithPath: wavPath).deletingPathExtension().appendingPathExtension("denoised.wav")
-                writeWavMono(clean48f, sampleRate: 48000, to: outURL)
-                samples = try resampleAudio(clean48f, from: 48000, to: 16000)
-                FileHandle.standardError.write(Data("denoised -> \(outURL.path) (listen) ; feeding cleaned audio\n".utf8))
+                // Prefer AudioEnhanceKit's tish-denoise — DeepFilterNet on the ANE
+                // (no GPU contention with the local ASR models). MLX/GPU is the
+                // fallback if the binary isn't found.
+                let aneTish = tishPath ?? [
+                    "/Volumes/DATA/AudioEnhanceKit/.build/release/tish-denoise",
+                    "/Volumes/DATA/AudioEnhanceKit/.build/arm64-apple-macosx/release/tish-denoise",
+                ].first { FileManager.default.isExecutableFile(atPath: $0) }
+
+                if let aneTish {
+                    FileHandle.standardError.write(Data("denoising on ANE (AudioEnhanceKit DFN '\(dfnModel)')...\n".utf8))
+                    let p = Process()
+                    p.executableURL = URL(fileURLWithPath: aneTish)
+                    p.arguments = ["--model", dfnModel, wavPath, outURL.path]
+                    p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+                    try p.run(); p.waitUntilExit()
+                    guard p.terminationStatus == 0 else {
+                        FileHandle.standardError.write(Data("tish-denoise failed (exit \(p.terminationStatus))\n".utf8)); exit(1)
+                    }
+                    let (sr, raw) = try loadAudioArray(from: outURL, sampleRate: 16000)
+                    precondition(sr == 16000)
+                    samples = (raw.ndim > 1 ? raw.mean(axis: -1) : raw).asType(.float32).asArray(Float.self)
+                    FileHandle.standardError.write(Data("denoised (ANE) -> \(outURL.path) (listen) ; feeding cleaned audio\n".utf8))
+                } else {
+                    // MLX/GPU DeepFilterNet (48 kHz, offline). Needs a local DFN dir
+                    // via --dfn (hf hub-cache download yields xet pointers).
+                    FileHandle.standardError.write(Data("denoising on GPU (MLX DeepFilterNet v3)...\n".utf8))
+                    let dfn: DeepFilterNetModel
+                    if let local = dfnRepo ?? Self.dfnSnapshotDir() {
+                        dfn = try await DeepFilterNetModel.fromPretrained(local, subfolder: "v3")
+                    } else {
+                        dfn = try await DeepFilterNetModel.fromPretrained()
+                    }
+                    let (_, raw48) = try loadAudioArray(from: URL(fileURLWithPath: wavPath), sampleRate: 48000)
+                    let mono48 = (raw48.ndim > 1 ? raw48.mean(axis: -1) : raw48).asType(.float32)
+                    let clean48f = try dfn.enhance(mono48).reshaped([-1]).asArray(Float.self)
+                    writeWavMono(clean48f, sampleRate: 48000, to: outURL)
+                    samples = try resampleAudio(clean48f, from: 48000, to: 16000)
+                    FileHandle.standardError.write(Data("denoised (GPU) -> \(outURL.path) (listen) ; feeding cleaned audio\n".utf8))
+                }
             } else {
                 let (sr, raw) = try loadAudioArray(from: URL(fileURLWithPath: wavPath), sampleRate: 16000)
                 precondition(sr == 16000, "expected 16k, got \(sr)")
