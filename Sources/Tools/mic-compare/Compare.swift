@@ -398,6 +398,18 @@ struct MicCompare {
                 step: { let r = s.step($0); return r.confirmed + (r.volatile.isEmpty ? "" : " ⟨\(r.volatile.trimmingCharacters(in: .whitespaces))⟩") },
                 finish: { let r = s.finish(); return r.confirmed + r.volatile }))
         }
+        if wanted("two-tier") {
+            FileHandle.standardError.write(Data("loading two-tier (Nemotron partial + Voxtral final)...\n".utf8))
+            let nm = try await NemotronASRModel.fromPretrained(nemoRepo)
+            let vm = try await VoxtralRealtimeModel.fromPretrained(voxRepo)
+            let nw = nm.makeStreamSession(language: language, chunkMs: 80); _ = nw.step([Float](repeating: 0, count: 16000)); _ = nw.finish()
+            let vw = vm.makeStreamSession(); _ = vw.step([Float](repeating: 0, count: 16000)); _ = vw.finish()
+            let s = TwoTierSession(nemotron: nm, voxtral: vm, language: language, fastChunkMs: 80)
+            providers.append(LocalASR(
+                label: "TWO-TIER Nemotron→Voxtral", gated: vad != nil,
+                step: { let r = s.step($0); return r.confirmed + (r.partial.isEmpty ? "" : " ⟨\(r.partial)⟩") },
+                finish: { let r = s.finish(); return r.confirmed }))
+        }
         if wanted("apple") {
             if #available(macOS 26.0, iOS 26.0, *) {
                 let loc: String = {
