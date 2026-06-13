@@ -21,3 +21,6 @@ scripts/
 .tmp/
 audit-repo/
 /scratchpad
+
+# local cloud-ASR keys (mic-compare)
+.env
