@@ -113,6 +113,7 @@ final class GeminiASR: LiveASR {
     private var snap: Snap
     private var task: URLSessionWebSocketTask?
     private var ready = false
+    private var activityStarted = false
     private var transcript = ""
     private var lastWallNow = 0.0
     private var speechWall = -1.0
@@ -124,13 +125,17 @@ final class GeminiASR: LiveASR {
         let t = URLSession.shared.webSocketTask(with: url)
         task = t
         t.resume()
-        // setup: model + input transcription. Native-audio models require an AUDIO
-        // response modality even when we only read input transcription.
+        // setup: transcribe input only. `automaticActivityDetection.disabled` stops
+        // the model from treating pauses as dialogue turns and generating spoken
+        // responses — that response flood otherwise starves the local models'
+        // CPU and they fall seconds behind. We never send activityStart/End, so the
+        // model just transcribes the input stream and never replies.
         let setup: [String: Any] = [
             "setup": [
                 "model": "models/\(model)",
                 "generationConfig": ["responseModalities": ["AUDIO"]],
                 "inputAudioTranscription": [:],
+                "realtimeInputConfig": ["automaticActivityDetection": ["disabled": true]],
             ],
         ]
         if let d = try? JSONSerialization.data(withJSONObject: setup), let s = String(data: d, encoding: .utf8) {
@@ -140,8 +145,20 @@ final class GeminiASR: LiveASR {
     }
 
     func feed(_ f: AudioFrame) {
-        lock.lock(); lastWallNow = f.wallNow; if f.speechActive, speechWall < 0 { speechWall = f.wallNow }; let r = ready; lock.unlock()
+        lock.lock()
+        lastWallNow = f.wallNow
+        if f.speechActive, speechWall < 0 { speechWall = f.wallNow }
+        let r = ready
+        let needStart = ready && !activityStarted
+        if needStart { activityStarted = true }
+        lock.unlock()
         guard r else { return }
+        // Manual activity: one activityStart, never activityEnd → the model
+        // transcribes the stream continuously and never completes a turn (so it
+        // never generates an audio/text reply that would flood the socket).
+        if needStart {
+            task?.send(.string("{\"realtimeInput\":{\"activityStart\":{}}}")) { _ in }
+        }
         let b64 = f.pcm16le.base64EncodedString()
         let msg: [String: Any] = ["realtimeInput": ["mediaChunks": [["mimeType": "audio/pcm;rate=16000", "data": b64]]]]
         if let d = try? JSONSerialization.data(withJSONObject: msg), let s = String(data: d, encoding: .utf8) {
