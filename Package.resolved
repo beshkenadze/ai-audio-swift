@@ -1,5 +1,5 @@
 {
-  "originHash" : "0de47e2efcfdbd2abb306b485c46d6fc9b94854ac10c7413ede360d5ad7e2260",
+  "originHash" : "48aef8f56cbba28f9b2ddf31bfe8a11404bdeb59e533f2a4ade036cb8c55f9f7",
   "pins" : [
     {
       "identity" : "async-http-client",
@@ -20,6 +20,15 @@
       }
     },
     {
+      "identity" : "fluidaudio",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/FluidInference/FluidAudio.git",
+      "state" : {
+        "revision" : "3c6e79f1d74411cae1f3daf50260dd19a585dc2d",
+        "version" : "0.15.3"
+      }
+    },
+    {
       "identity" : "mlx-swift",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/ml-explore/mlx-swift.git",
@@ -35,6 +44,15 @@
       "state" : {
         "revision" : "1c05248bb0899e2a7a4962b84d319cf12f4e12aa",
         "version" : "3.31.3"
+      }
+    },
+    {
+      "identity" : "rnnoise",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/ronnyf/rnnoise.git",
+      "state" : {
+        "revision" : "6eecf0f4db9864221c777383d99795912703068e",
+        "version" : "1.0.1"
       }
     },
     {

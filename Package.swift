@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "MLXAudio",
-    platforms: [.macOS(.v14), .iOS(.v17)],
+    platforms: [.macOS(.v15), .iOS(.v17)],
     products: [
         // Core foundation library
         .library(name: "MLXAudioCore", targets: ["MLXAudioCore"]),
@@ -71,7 +71,8 @@ let package = Package(
         .package(url: "https://github.com/ml-explore/mlx-swift.git", .upToNextMajor(from: "0.30.6")),
         .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", .upToNextMajor(from: "3.31.3")),
         .package(url: "https://github.com/huggingface/swift-transformers.git", .upToNextMajor(from: "1.1.6")),
-        .package(url: "https://github.com/huggingface/swift-huggingface.git", .upToNextMajor(from: "0.8.1"))
+        .package(url: "https://github.com/huggingface/swift-huggingface.git", .upToNextMajor(from: "0.8.1")),
+        .package(path: "../../AudioEnhanceKit")
     ],
     targets: [
         // MARK: - MLXAudioCore
@@ -287,7 +288,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "mic-compare",
-            dependencies: ["MLXAudioCore", "MLXAudioSTT", "MLXAudioVAD", "MLXAudioSTS"],
+            dependencies: ["MLXAudioCore", "MLXAudioSTT", "MLXAudioVAD", "MLXAudioSTS", .product(name: "AudioEnhanceKitDFN", package: "AudioEnhanceKit")],
             path: "Sources/Tools/mic-compare"
         ),
 
