@@ -389,6 +389,15 @@ struct MicCompare {
             providers.append(LocalASR(label: "VOXTRAL 4B \(quant(voxRepo)) (480ms)",
                                       gated: vad != nil, step: { s.step($0); return s.text }, finish: { _ = s.finish(); return s.text }))
         }
+        if wanted("voxtral-la") {
+            FileHandle.standardError.write(Data("loading voxtral+LA...\n".utf8))
+            let m = try await VoxtralRealtimeModel.fromPretrained(voxRepo)
+            let s = VoxtralLocalAgreementSession(model: m, tickMs: 600)
+            providers.append(LocalASR(
+                label: "VOXTRAL+LA \(quant(voxRepo)) (self-agreement)", gated: vad != nil,
+                step: { let r = s.step($0); return r.confirmed + (r.volatile.isEmpty ? "" : " ⟨\(r.volatile.trimmingCharacters(in: .whitespaces))⟩") },
+                finish: { let r = s.finish(); return r.confirmed + r.volatile }))
+        }
         if wanted("apple") {
             if #available(macOS 26.0, iOS 26.0, *) {
                 let loc: String = {

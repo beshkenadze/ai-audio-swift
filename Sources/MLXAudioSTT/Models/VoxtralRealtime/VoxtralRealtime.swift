@@ -128,6 +128,50 @@ public final class VoxtralRealtimeModel: Module, STTGenerationModel {
         )
     }
 
+    /// Offline decode returning the raw generated token ids — EOS stripped, but the
+    /// streaming control tokens kept ([STREAMING_PAD]=32, [STREAMING_WORD]=33). The
+    /// decode emits exactly one token per 80 ms audio frame, so a [STREAMING_WORD]'s
+    /// index is a direct proxy for that word's end frame. Local-Agreement re-decoding
+    /// uses this to recover word boundaries + end-times. Mirrors `generate`'s loop.
+    public func transcribeTokens(
+        audio: MLXArray,
+        maxTokens: Int = 4096,
+        temperature: Float = 0
+    ) -> [Int] {
+        let audio1D = audio.ndim > 1 ? audio.mean(axis: -1) : audio
+        var context = encodeAndPrefill(audio: audio1D, verbose: false, transcriptionDelayMs: nil)
+
+        var generated: [Int] = []
+        var pendingToken = sampleLazy(logits: context.logits, temperature: temperature)
+        asyncEval(pendingToken)
+
+        for pos in context.promptLength..<context.nAudioTotal {
+            let tokenEmbed = decoder.embedTokens(pendingToken.reshaped([1]))
+            let inputEmbed: MLXArray
+            if pos < context.adapterOut.shape[0] {
+                inputEmbed = context.adapterOut[pos..<(pos + 1), 0...] + tokenEmbed
+            } else {
+                inputEmbed = tokenEmbed
+            }
+            let next = decoder(inputEmbed, startPos: pos, cache: context.cache)
+            let nextLogits = decoder.logits(next.0[0])
+            let nextToken = sampleLazy(logits: nextLogits, temperature: temperature)
+            asyncEval(nextToken)
+
+            let token = pendingToken.item(Int.self)
+            generated.append(token)
+            if token == config.eosTokenId || generated.count > maxTokens { break }
+
+            context.cache = next.1
+            context.logits = nextLogits
+            pendingToken = nextToken
+            if generated.count % 256 == 0 { Memory.clearCache() }
+        }
+        if generated.last == config.eosTokenId { _ = generated.popLast() }
+        Memory.clearCache()
+        return generated
+    }
+
     public func generateStream(
         audio: MLXArray,
         generationParameters: STTGenerateParameters
