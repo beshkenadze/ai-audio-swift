@@ -147,12 +147,39 @@ private final class CompareRunner: @unchecked Sendable {
         engine.inputNode.removeTap(onBus: 0)
         queue.sync {
             if !pending.isEmpty { stepBoth(pending); pending = [] }
-            nemoStats.transcript = nemo.finish().text.isEmpty ? nemo.text : nemo.text
-            voxStats.transcript = vox.finish().text.isEmpty ? vox.text : vox.text
+            _ = nemo.finish(); nemoStats.transcript = nemo.text
+            _ = vox.finish(); voxStats.transcript = vox.text
             hud.render(nemoStats, voxStats, wall: CFAbsoluteTimeGetCurrent() - startTime)
         }
         hud.end()
-        FileHandle.standardError.write(Data("\n=== \(nemoStats.label) ===\n\(nemo.text)\n\n=== \(voxStats.label) ===\n\(vox.text)\n".utf8))
+        printSummary()
+    }
+
+    private func printSummary() {
+        func metrics(_ s: Stats) -> (words: Int, avg: Double, rtf: Double, ttft: String, lag: Double) {
+            let audioS = Double(s.audioSamples) / 16000.0
+            let avg = s.chunks > 0 ? s.stepMsTotal / Double(s.chunks) : 0
+            let rtf = audioS > 0 ? (s.stepMsTotal / 1000) / audioS : 0
+            let wall = CFAbsoluteTimeGetCurrent() - startTime
+            let ttft = s.firstTextDelay >= 0 ? String(format: "%.2fs", s.firstTextDelay) : "—"
+            return (s.transcript.split(whereSeparator: \.isWhitespace).count, avg, rtf, ttft, max(0, wall - audioS))
+        }
+        let n = metrics(nemoStats), v = metrics(voxStats)
+        let audioS = Double(nemoStats.audioSamples) / 16000.0
+        func row(_ k: String, _ a: String, _ b: String) -> String {
+            k.padding(toLength: 12, withPad: " ", startingAt: 0)
+                + a.padding(toLength: 30, withPad: " ", startingAt: 0) + b
+        }
+        var out = "\n══════════════ COMPARISON (audio \(String(format: "%.1f", audioS))s) ══════════════\n"
+        out += row("", nemoStats.label, voxStats.label) + "\n"
+        out += row("words", "\(n.words)", "\(v.words)") + "\n"
+        out += row("avg step", String(format: "%.0fms", n.avg), String(format: "%.0fms", v.avg)) + "\n"
+        out += row("RTF", String(format: "%.2f", n.rtf), String(format: "%.2f", v.rtf)) + "\n"
+        out += row("TTFT", n.ttft, v.ttft) + "\n"
+        out += row("lag", String(format: "%.2fs", n.lag), String(format: "%.2fs", v.lag)) + "\n"
+        out += "───────────────────────────────────────────────────────\n"
+        out += "NEMOTRON: \(nemoStats.transcript)\n\nVOXTRAL:  \(voxStats.transcript)\n"
+        FileHandle.standardError.write(Data(out.utf8))
     }
 
     private func convert(_ buffer: AVAudioPCMBuffer) -> [Float] {
@@ -261,11 +288,15 @@ struct MicCompare {
         let wv = voxModel.makeStreamSession()
         _ = wv.step([Float](repeating: 0, count: 16000 * 2)); _ = wv.finish()
 
+        func quant(_ r: String) -> String {
+            for q in ["8bit", "4bit", "6bit", "bf16", "fp16"] where r.lowercased().contains(q) { return q }
+            return "?"
+        }
         let runner = CompareRunner(
             nemo: nemoModel.makeStreamSession(language: language, chunkMs: chunkMs),
-            nemoLabel: "NEMOTRON 0.6b (\(chunkMs.map { "\($0)ms" } ?? "native"))",
+            nemoLabel: "NEMOTRON 0.6b \(quant(nemoRepo)) (\(chunkMs.map { "\($0)ms" } ?? "native"))",
             vox: voxModel.makeStreamSession(),
-            voxLabel: "VOXTRAL 4B (480ms)",
+            voxLabel: "VOXTRAL 4B \(quant(voxRepo)) (480ms)",
             feedSamples: max(1, 16000 * feedMs / 1000),
             inputDevice: inputDevice
         )
