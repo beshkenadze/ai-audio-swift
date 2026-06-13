@@ -4,6 +4,7 @@ import Foundation
 import MLX
 import MLXAudioCore
 import MLXAudioSTT
+import MLXAudioVAD
 
 // Side-by-side live ASR: feeds one mic stream into BOTH Nemotron and Voxtral
 // streaming sessions and shows their transcripts + metrics stacked, redrawn in
@@ -53,21 +54,26 @@ private struct HUD {
         return Array(lines.suffix(maxLines))  // keep the most recent lines
     }
 
-    func render(_ a: Stats, _ b: Stats, wall: Double) {
+    func render(_ a: Stats, _ b: Stats, wall: Double, vad: (on: Bool, active: Bool, prob: Float)? = nil) {
         guard isTTY else { return }
         let (cols, rows) = (cols, rows)
-        let bodyLines = max(2, (rows - 6) / 2)
+        let bodyLines = max(2, (rows - 7) / 2)
         var out = "\u{1B}[H\u{1B}[2J"
+        if let vad, vad.on {
+            let dot = vad.active ? "● SPEECH" : "○ silence"
+            out += String(format: " VAD %@  p=%.2f  (Voxtral gated)\n", dot, vad.prob)
+        }
         for s in [a, b] {
             let audioS = Double(s.audioSamples) / 16000.0
             let avg = s.chunks > 0 ? s.stepMsTotal / Double(s.chunks) : 0
             let rtf = audioS > 0 ? (s.stepMsTotal / 1000) / audioS : 0
             let lag = max(0, wall - audioS)
             let ttft = s.firstTextDelay >= 0 ? String(format: "%.2fs", s.firstTextDelay) : "—"
+            let lagStr = s.chunks > 0 ? String(format: "%.2fs", lag) : "—"
             let words = s.transcript.split(whereSeparator: \.isWhitespace).count
             let head = String(
-                format: " %@  lag %.2fs · words %d · step %.0f/%.0fms · RTF %.2f · TTFT %@",
-                s.label, lag, words, s.lastStepMs, avg, rtf, ttft)
+                format: " %@  lag %@ · words %d · step %.0f/%.0fms · RTF %.2f · TTFT %@",
+                s.label, lagStr, words, s.lastStepMs, avg, rtf, ttft)
             out += "\u{1B}[7m" + head.padding(toLength: min(cols, max(head.count, cols)), withPad: " ", startingAt: 0)
                 + "\u{1B}[0m\n"
             for l in wrap(s.transcript.isEmpty ? "…" : s.transcript, width: cols - 1, maxLines: bodyLines) {
@@ -101,14 +107,24 @@ private final class CompareRunner: @unchecked Sendable {
     private let hud = HUD()
     private var ticker: DispatchSourceTimer?
 
+    // VAD gate (gates Voxtral so it doesn't hallucinate on silence/noise).
+    private let vad: SileroVAD?
+    private var vadState: SileroVADStreamingState?
+    private var vadBuffer: [Float] = []
+    private var speechActive = false
+    private var silenceWindows = 0
+    private var lastVadProb: Float = 0
+    private let hangoverWindows = 8  // ~256 ms keep-open after speech drops
+
     init(nemo: NemotronASRStreamSession, nemoLabel: String,
          vox: VoxtralRealtimeStreamSession, voxLabel: String,
-         feedSamples: Int, inputDevice: AudioDeviceID?) {
+         feedSamples: Int, inputDevice: AudioDeviceID?, vad: SileroVAD?) {
         self.nemo = nemo
         self.vox = vox
+        self.vad = vad
         self.feedSamples = feedSamples
         self.nemoStats = Stats(label: nemoLabel)
-        self.voxStats = Stats(label: voxLabel)
+        self.voxStats = Stats(label: voxLabel + (vad != nil ? " ·VAD-gated" : ""))
 
         if let dev = inputDevice ?? AudioDevices.defaultInput() {
             try? AudioDevices.setInput(dev, on: engine)
@@ -136,7 +152,10 @@ private final class CompareRunner: @unchecked Sendable {
         try engine.start()
         let t = DispatchSource.makeTimerSource(queue: queue)
         t.schedule(deadline: .now() + 0.2, repeating: 0.2)
-        t.setEventHandler { [self] in hud.render(nemoStats, voxStats, wall: CFAbsoluteTimeGetCurrent() - startTime) }
+        t.setEventHandler { [self] in
+            hud.render(nemoStats, voxStats, wall: CFAbsoluteTimeGetCurrent() - startTime,
+                       vad: (on: vad != nil, active: speechActive, prob: lastVadProb))
+        }
         t.resume()
         ticker = t
     }
@@ -149,7 +168,8 @@ private final class CompareRunner: @unchecked Sendable {
             if !pending.isEmpty { stepBoth(pending); pending = [] }
             _ = nemo.finish(); nemoStats.transcript = nemo.text
             _ = vox.finish(); voxStats.transcript = vox.text
-            hud.render(nemoStats, voxStats, wall: CFAbsoluteTimeGetCurrent() - startTime)
+            hud.render(nemoStats, voxStats, wall: CFAbsoluteTimeGetCurrent() - startTime,
+                       vad: (on: vad != nil, active: speechActive, prob: lastVadProb))
         }
         hud.end()
         printSummary()
@@ -176,7 +196,9 @@ private final class CompareRunner: @unchecked Sendable {
         out += row("avg step", String(format: "%.0fms", n.avg), String(format: "%.0fms", v.avg)) + "\n"
         out += row("RTF", String(format: "%.2f", n.rtf), String(format: "%.2f", v.rtf)) + "\n"
         out += row("TTFT", n.ttft, v.ttft) + "\n"
-        out += row("lag", String(format: "%.2fs", n.lag), String(format: "%.2fs", v.lag)) + "\n"
+        let nLag = nemoStats.chunks > 0 ? String(format: "%.2fs", n.lag) : "—"
+        let vLag = voxStats.chunks > 0 ? String(format: "%.2fs", v.lag) : "—"
+        out += row("lag", nLag, vLag) + "\n"
         out += "───────────────────────────────────────────────────────\n"
         out += "NEMOTRON: \(nemoStats.transcript)\n\nVOXTRAL:  \(voxStats.transcript)\n"
         FileHandle.standardError.write(Data(out.utf8))
@@ -200,6 +222,20 @@ private final class CompareRunner: @unchecked Sendable {
 
     private func feed(_ floats: [Float]) {
         queue.async { [self] in
+            // VAD runs on its own 512-sample windows to keep speechActive current
+            // before the (coarser) model chunks are gated.
+            if let vad {
+                vadBuffer.append(contentsOf: floats)
+                while vadBuffer.count >= 512 {
+                    let w = Array(vadBuffer.prefix(512)); vadBuffer.removeFirst(512)
+                    if let (prob, st) = try? vad.feed(chunk: MLXArray(w), state: vadState) {
+                        vadState = st
+                        lastVadProb = prob.asArray(Float.self).max() ?? 0
+                        if lastVadProb > 0.5 { speechActive = true; silenceWindows = 0 }
+                        else { silenceWindows += 1; if silenceWindows > hangoverWindows { speechActive = false } }
+                    }
+                }
+            }
             pending.append(contentsOf: floats)
             while pending.count >= feedSamples {
                 let chunk = Array(pending.prefix(feedSamples))
@@ -226,6 +262,9 @@ private final class CompareRunner: @unchecked Sendable {
             nemoStats.firstTextDelay = CFAbsoluteTimeGetCurrent() - origin
         }
 
+        // Voxtral: gated by VAD when enabled — silence chunks are skipped so it
+        // never sees (and hallucinates on) non-speech.
+        guard vad == nil || speechActive else { return }
         t = CFAbsoluteTimeGetCurrent()
         let vd = vox.step(chunk)
         voxStats.lastStepMs = (CFAbsoluteTimeGetCurrent() - t) * 1000
@@ -251,6 +290,8 @@ struct MicCompare {
         var seconds: Double? = nil
         var feedMs = 480
         var inputQuery: String? = nil
+        var useVad = false
+        var vadRepo = "mlx-community/silero-vad"
 
         var it = CommandLine.arguments.dropFirst().makeIterator()
         while let a = it.next() {
@@ -262,6 +303,8 @@ struct MicCompare {
             case "--seconds": seconds = Double(it.next() ?? "")
             case "--feed-ms": feedMs = Int(it.next() ?? "") ?? feedMs
             case "--input": inputQuery = it.next()
+            case "--vad": useVad = true
+            case "--vad-repo": vadRepo = it.next() ?? vadRepo
             case "--list-devices":
                 let def = AudioDevices.defaultInput()
                 for d in AudioDevices.inputs() { print("\(d.name)\(d.id == def ? " (default)" : "")\n    uid: \(d.uid)") }
@@ -278,9 +321,10 @@ struct MicCompare {
             inputDevice = found.id
         }
 
-        FileHandle.standardError.write(Data("loading nemotron + voxtral...\n".utf8))
+        FileHandle.standardError.write(Data("loading nemotron + voxtral\(useVad ? " + silero-vad" : "")...\n".utf8))
         let nemoModel = try await NemotronASRModel.fromPretrained(nemoRepo)
         let voxModel = try await VoxtralRealtimeModel.fromPretrained(voxRepo)
+        let vad = useVad ? try await SileroVAD.fromPretrained(vadRepo) : nil
 
         // Warm both so first live chunks aren't cold.
         let wn = nemoModel.makeStreamSession(language: language, chunkMs: chunkMs)
@@ -298,7 +342,8 @@ struct MicCompare {
             vox: voxModel.makeStreamSession(),
             voxLabel: "VOXTRAL 4B \(quant(voxRepo)) (480ms)",
             feedSamples: max(1, 16000 * feedMs / 1000),
-            inputDevice: inputDevice
+            inputDevice: inputDevice,
+            vad: vad
         )
 
         try runner.start()
