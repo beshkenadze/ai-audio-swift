@@ -3,7 +3,6 @@ import Darwin
 import Foundation
 import MLX
 import MLXAudioCore
-import MLXAudioSTS
 import MLXAudioSTT
 import MLXAudioVAD
 import AudioEnhanceKitCore
@@ -15,6 +14,7 @@ import AudioEnhanceKitDPDFNet
 protocol LiveDenoiser: AnyObject {
     func enqueueInput(_ samples: UnsafePointer<Float>, count: Int) -> Bool
     func dequeueOutput(into dst: UnsafeMutablePointer<Float>, maxCount: Int) -> Int
+    func requestFlush()
     func stop()
 }
 extension AsyncStreamingDenoiser: LiveDenoiser {}
@@ -110,17 +110,17 @@ private final class CompareRunner: @unchecked Sendable {
     private let engine = AVAudioEngine()
     private let inFmt: AVAudioFormat
     private let outFmt: AVAudioFormat
-    private let converter: AVAudioConverter
     private let hud = HUD()
     private var ticker: DispatchSourceTimer?
 
     private let recordURL: URL?
     private var recordBuffer: [Float] = []
 
-    // Live ANE denoise: mic 48k mono -> DeepFilterNet on the Neural Engine ->
-    // clean 48k -> downsample to 16k for ASR. GPU stays free for the models.
+    // Single audio path (mic OR file): source -> 48k mono -> optional ANE denoise
+    // (DeepFilterNet/DPDFNet) -> 16k -> ASR. GPU stays free for the models.
     private let denoiser: (any LiveDenoiser)?
-    private let cleanConv: AVAudioConverter?  // 48k mono -> 16k mono (clean path)
+    private let to48: AVAudioConverter    // mic input format -> 48k mono
+    private let down16: AVAudioConverter  // 48k mono -> 16k mono (the one downsample)
     private var dnOut = [Float](repeating: 0, count: 16384)
 
     init(providers: [LiveASR], vad: SileroVAD?, feedSamples: Int, inputDevice: AudioDeviceID?,
@@ -137,14 +137,12 @@ private final class CompareRunner: @unchecked Sendable {
         }
         self.inFmt = engine.inputNode.outputFormat(forBus: 0)
         guard let out = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false),
-              let conv = AVAudioConverter(from: inFmt, to: out) else { fatalError("converter setup failed for \(inFmt)") }
+              let mono48 = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 1, interleaved: false),
+              let c48 = AVAudioConverter(from: inFmt, to: mono48),
+              let c16 = AVAudioConverter(from: mono48, to: out) else { fatalError("converter setup failed for \(inFmt)") }
         self.outFmt = out
-        self.converter = conv
-        if denoiser != nil, let mono48 = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 1, interleaved: false) {
-            self.cleanConv = AVAudioConverter(from: mono48, to: out)
-        } else {
-            self.cleanConv = nil
-        }
+        self.to48 = c48
+        self.down16 = c16
     }
 
     func start(mic: Bool = true) throws {
@@ -152,20 +150,8 @@ private final class CompareRunner: @unchecked Sendable {
         hud.begin()
         if mic {
             engine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: inFmt) { [self] buf, _ in
-                if let denoiser, let cleanConv {
-                    // mic -> 48k mono -> ANE denoise -> 48k -> 16k -> ASR
-                    let mono48 = downmix48k(buf)
-                    if !mono48.isEmpty {
-                        mono48.withUnsafeBufferPointer { _ = denoiser.enqueueInput($0.baseAddress!, count: $0.count) }
-                    }
-                    let n = dnOut.withUnsafeMutableBufferPointer { denoiser.dequeueOutput(into: $0.baseAddress!, maxCount: $0.count) }
-                    if n > 0 {
-                        let clean16 = resampleMono(Array(dnOut[0..<n]), via: cleanConv)
-                        if !clean16.isEmpty { feed(clean16) }
-                    }
-                } else {
-                    let f = convert(buf); if !f.isEmpty { feed(f) }
-                }
+                let mono48 = resampleMono(buf, via: to48)  // mic format -> 48k mono
+                if !mono48.isEmpty { feedSource48(mono48) }
             }
             engine.prepare(); try engine.start()
         }
@@ -177,16 +163,24 @@ private final class CompareRunner: @unchecked Sendable {
         t.resume(); ticker = t
     }
 
-    /// Drive from a 16 kHz mono file at real-time pace (no mic) — for verifying
-    /// providers (incl. cloud) on a known clip without speaking.
-    func feedFileRealtime(_ samples: [Float]) {
-        let cs = feedSamples
+    /// Emulate the mic from a 48 kHz mono file at real-time pace — same single path
+    /// as the live tap (denoise included), so a recorded clip is deterministic.
+    func feedFile48Realtime(_ mono48: [Float]) {
+        let cs = 4800  // 0.1s @48k
         var i = 0
-        while i < samples.count {
-            let e = min(i + cs, samples.count)
-            feed(Array(samples[i..<e]))
+        while i < mono48.count {
+            let e = min(i + cs, mono48.count)
+            feedSource48(Array(mono48[i..<e]))
             i = e
-            Thread.sleep(forTimeInterval: Double(cs) / 16000.0)  // ~real-time pacing
+            Thread.sleep(forTimeInterval: Double(cs) / 48000.0)  // ~real-time pacing
+        }
+        if let denoiser {  // flush the denoiser tail
+            denoiser.requestFlush()
+            for _ in 0..<20 {
+                let n = dnOut.withUnsafeMutableBufferPointer { denoiser.dequeueOutput(into: $0.baseAddress!, maxCount: $0.count) }
+                if n > 0 { let s16 = resampleMono(Array(dnOut[0..<n]), via: down16); if !s16.isEmpty { feed(s16) } }
+                Thread.sleep(forTimeInterval: 0.03)
+            }
         }
     }
 
@@ -209,12 +203,28 @@ private final class CompareRunner: @unchecked Sendable {
         printSummary()
     }
 
-    private func convert(_ buffer: AVAudioPCMBuffer) -> [Float] {
-        let ratio = outFmt.sampleRate / inFmt.sampleRate
-        let cap = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 16
-        guard let out = AVAudioPCMBuffer(pcmFormat: outFmt, frameCapacity: cap) else { return [] }
+    /// THE single audio path: 48k mono in -> optional ANE denoise -> 16k -> ASR.
+    /// Both the mic tap and the file feeder call this, so behaviour is identical.
+    private func feedSource48(_ mono48: [Float]) {
+        var s48 = mono48
+        if let denoiser {
+            mono48.withUnsafeBufferPointer { _ = denoiser.enqueueInput($0.baseAddress!, count: $0.count) }
+            let n = dnOut.withUnsafeMutableBufferPointer { denoiser.dequeueOutput(into: $0.baseAddress!, maxCount: $0.count) }
+            s48 = n > 0 ? Array(dnOut[0..<n]) : []
+        }
+        if !s48.isEmpty {
+            let s16 = resampleMono(s48, via: down16)
+            if !s16.isEmpty { feed(s16) }
+        }
+    }
+
+    /// Convert a PCM buffer through a stateful converter -> [Float] (its output fmt).
+    private func resampleMono(_ buffer: AVAudioPCMBuffer, via conv: AVAudioConverter) -> [Float] {
+        let outF = conv.outputFormat
+        let cap = AVAudioFrameCount(Double(buffer.frameLength) * outF.sampleRate / conv.inputFormat.sampleRate) + 64
+        guard let out = AVAudioPCMBuffer(pcmFormat: outF, frameCapacity: cap) else { return [] }
         let flag = Flag(); var err: NSError?
-        converter.convert(to: out, error: &err) { _, status in
+        conv.convert(to: out, error: &err) { _, status in
             if flag.done { status.pointee = .noDataNow; return nil }
             flag.done = true; status.pointee = .haveData; return buffer
         }
@@ -222,37 +232,14 @@ private final class CompareRunner: @unchecked Sendable {
         return Array(UnsafeBufferPointer(start: ch[0], count: Int(out.frameLength)))
     }
 
-    /// Downmix a tap buffer to mono [Float] at its native (48k) rate.
-    private func downmix48k(_ buffer: AVAudioPCMBuffer) -> [Float] {
-        guard let ch = buffer.floatChannelData else { return [] }
-        let n = Int(buffer.frameLength)
-        let channels = Int(buffer.format.channelCount)
-        if channels <= 1 { return Array(UnsafeBufferPointer(start: ch[0], count: n)) }
-        var out = [Float](repeating: 0, count: n)
-        for i in 0..<n {
-            var s: Float = 0
-            for c in 0..<channels { s += ch[c][i] }
-            out[i] = s / Float(channels)
-        }
-        return out
-    }
-
-    /// Resample mono [Float] through a stateful converter (48k -> 16k).
-    private func resampleMono(_ mono48: [Float], via conv: AVAudioConverter) -> [Float] {
-        let inFmt = conv.inputFormat
-        guard let inBuf = AVAudioPCMBuffer(pcmFormat: inFmt, frameCapacity: AVAudioFrameCount(mono48.count)),
+    /// Same, for a mono [Float] (wraps it in a buffer at the converter's input rate).
+    private func resampleMono(_ samples: [Float], via conv: AVAudioConverter) -> [Float] {
+        guard !samples.isEmpty,
+              let inBuf = AVAudioPCMBuffer(pcmFormat: conv.inputFormat, frameCapacity: AVAudioFrameCount(samples.count)),
               let dst = inBuf.floatChannelData else { return [] }
-        mono48.withUnsafeBufferPointer { dst[0].update(from: $0.baseAddress!, count: mono48.count) }
-        inBuf.frameLength = AVAudioFrameCount(mono48.count)
-        let cap = AVAudioFrameCount(Double(mono48.count) * outFmt.sampleRate / inFmt.sampleRate) + 16
-        guard let out = AVAudioPCMBuffer(pcmFormat: outFmt, frameCapacity: cap) else { return [] }
-        let flag = Flag(); var err: NSError?
-        conv.convert(to: out, error: &err) { _, status in
-            if flag.done { status.pointee = .noDataNow; return nil }
-            flag.done = true; status.pointee = .haveData; return inBuf
-        }
-        guard err == nil, out.frameLength > 0, let ch = out.floatChannelData else { return [] }
-        return Array(UnsafeBufferPointer(start: ch[0], count: Int(out.frameLength)))
+        samples.withUnsafeBufferPointer { dst[0].update(from: $0.baseAddress!, count: samples.count) }
+        inBuf.frameLength = AVAudioFrameCount(samples.count)
+        return resampleMono(inBuf, via: conv)
     }
 
     private func feed(_ floats: [Float]) {
@@ -308,12 +295,6 @@ private final class CompareRunner: @unchecked Sendable {
 
 @main
 struct MicCompare {
-    /// Latest local snapshot dir of the DFN repo in the hf cache, if present.
-    static func dfnSnapshotDir() -> String? {
-        let base = NSHomeDirectory() + "/.cache/huggingface/hub/models--mlx-community--DeepFilterNet-mlx/snapshots"
-        guard let snaps = try? FileManager.default.contentsOfDirectory(atPath: base), !snaps.isEmpty else { return nil }
-        return base + "/" + snaps.sorted().last!
-    }
 
     static func main() async throws {
         GPU.set(memoryLimit: 18 * 1024 * 1024 * 1024, relaxed: false)
@@ -334,8 +315,6 @@ struct MicCompare {
         var recordPath: String? = nil
         var onlyArg: String? = nil
         var denoise = false
-        var dfnRepo: String? = nil
-        var tishPath: String? = nil
         var dfnModel = "standard"
         var denoiserKind = "dfn"   // dfn | dpdfnet
 
@@ -358,8 +337,6 @@ struct MicCompare {
             case "--record": recordPath = it.next()
             case "--only": onlyArg = it.next()  // comma list: nemotron,voxtral,deepgram,gemini
             case "--denoise": denoise = true    // DeepFilterNet clean-up (--wav mode)
-            case "--dfn": dfnRepo = it.next()   // local MLX DFN model dir (fallback path)
-            case "--tish": tishPath = it.next() // AudioEnhanceKit tish-denoise binary (ANE DFN)
             case "--dfn-model": dfnModel = it.next() ?? dfnModel  // standard|enhanced|v2b|v2b_n4|v2b_n4_4bit
             case "--denoiser": denoiserKind = (it.next() ?? denoiserKind).lowercased()  // dfn | dpdfnet
             case "--list-devices":
@@ -422,21 +399,20 @@ struct MicCompare {
         // Live mic + --denoise: DeepFilterNet on the ANE, streamed in the tap at
         // its native 48 kHz (full benefit, GPU free). (--wav + --denoise uses the
         // offline tish-denoise path above.)
-        var liveDenoiser: (any LiveDenoiser)? = nil
-        if denoise && wavPath == nil {
+        func makeDenoiser() async throws -> any LiveDenoiser {
             if denoiserKind == "dpdfnet" {
-                let variant: DPDFNetVariant = DPDFNetVariant(rawValue: dfnModel) ?? .dpdfnet2_48khz_hr
-                FileHandle.standardError.write(Data("starting live ANE denoise (DPDFNet '\(variant.rawValue)', 48kHz)...\n".utf8))
-                var cfg = DPDFNetEnhancer.Config(variant: variant)
-                cfg.backend = .ane
-                liveDenoiser = try await AsyncDPDFNetEnhancer.create(config: cfg)
-            } else {
-                let variant = ModelVariant(rawValue: dfnModel) ?? .standard
-                FileHandle.standardError.write(Data("starting live ANE denoise (DeepFilterNet '\(variant.rawValue)', 48kHz)...\n".utf8))
-                liveDenoiser = try await AsyncStreamingDenoiser.create(
-                    config: .init(variant: variant, backend: .ane, compensateDelay: true, enableProfiling: false))
+                let variant = DPDFNetVariant(rawValue: dfnModel) ?? .dpdfnet2_48khz_hr
+                FileHandle.standardError.write(Data("ANE denoise: DPDFNet '\(variant.rawValue)' (48kHz)\n".utf8))
+                var cfg = DPDFNetEnhancer.Config(variant: variant); cfg.backend = .ane
+                return try await AsyncDPDFNetEnhancer.create(config: cfg)
             }
+            let variant = ModelVariant(rawValue: dfnModel) ?? .standard
+            FileHandle.standardError.write(Data("ANE denoise: DeepFilterNet '\(variant.rawValue)' (48kHz)\n".utf8))
+            return try await AsyncStreamingDenoiser.create(
+                config: .init(variant: variant, backend: .ane, compensateDelay: true, enableProfiling: false))
         }
+
+        let liveDenoiser: (any LiveDenoiser)? = denoise ? try await makeDenoiser() : nil
 
         let runner = CompareRunner(
             providers: providers, vad: vad,
@@ -444,56 +420,15 @@ struct MicCompare {
             recordURL: recordPath.map { URL(fileURLWithPath: $0) }, denoiser: liveDenoiser)
 
         if let wavPath {
-            let samples: [Float]
-            if denoise {
-                let outURL = URL(fileURLWithPath: wavPath).deletingPathExtension().appendingPathExtension("denoised.wav")
-                // Prefer AudioEnhanceKit's tish-denoise — DeepFilterNet on the ANE
-                // (no GPU contention with the local ASR models). MLX/GPU is the
-                // fallback if the binary isn't found.
-                let aneTish = tishPath ?? [
-                    "/Volumes/DATA/AudioEnhanceKit/.build/release/tish-denoise",
-                    "/Volumes/DATA/AudioEnhanceKit/.build/arm64-apple-macosx/release/tish-denoise",
-                ].first { FileManager.default.isExecutableFile(atPath: $0) }
-
-                if let aneTish {
-                    FileHandle.standardError.write(Data("denoising on ANE (AudioEnhanceKit DFN '\(dfnModel)')...\n".utf8))
-                    let p = Process()
-                    p.executableURL = URL(fileURLWithPath: aneTish)
-                    p.arguments = ["--model", dfnModel, wavPath, outURL.path]
-                    p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
-                    try p.run(); p.waitUntilExit()
-                    guard p.terminationStatus == 0 else {
-                        FileHandle.standardError.write(Data("tish-denoise failed (exit \(p.terminationStatus))\n".utf8)); exit(1)
-                    }
-                    let (sr, raw) = try loadAudioArray(from: outURL, sampleRate: 16000)
-                    precondition(sr == 16000)
-                    samples = (raw.ndim > 1 ? raw.mean(axis: -1) : raw).asType(.float32).asArray(Float.self)
-                    FileHandle.standardError.write(Data("denoised (ANE) -> \(outURL.path) (listen) ; feeding cleaned audio\n".utf8))
-                } else {
-                    // MLX/GPU DeepFilterNet (48 kHz, offline). Needs a local DFN dir
-                    // via --dfn (hf hub-cache download yields xet pointers).
-                    FileHandle.standardError.write(Data("denoising on GPU (MLX DeepFilterNet v3)...\n".utf8))
-                    let dfn: DeepFilterNetModel
-                    if let local = dfnRepo ?? Self.dfnSnapshotDir() {
-                        dfn = try await DeepFilterNetModel.fromPretrained(local, subfolder: "v3")
-                    } else {
-                        dfn = try await DeepFilterNetModel.fromPretrained()
-                    }
-                    let (_, raw48) = try loadAudioArray(from: URL(fileURLWithPath: wavPath), sampleRate: 48000)
-                    let mono48 = (raw48.ndim > 1 ? raw48.mean(axis: -1) : raw48).asType(.float32)
-                    let clean48f = try dfn.enhance(mono48).reshaped([-1]).asArray(Float.self)
-                    writeWavMono(clean48f, sampleRate: 48000, to: outURL)
-                    samples = try resampleAudio(clean48f, from: 48000, to: 16000)
-                    FileHandle.standardError.write(Data("denoised (GPU) -> \(outURL.path) (listen) ; feeding cleaned audio\n".utf8))
-                }
-            } else {
-                let (sr, raw) = try loadAudioArray(from: URL(fileURLWithPath: wavPath), sampleRate: 16000)
-                precondition(sr == 16000, "expected 16k, got \(sr)")
-                samples = (raw.ndim > 1 ? raw.mean(axis: -1) : raw).asType(.float32).asArray(Float.self)
-            }
+            // Emulate the mic: load at 48k mono and stream through the SAME single
+            // path (denoise included) at real-time pace — deterministic, both
+            // denoisers, no separate offline code.
+            let (_, raw) = try loadAudioArray(from: URL(fileURLWithPath: wavPath), sampleRate: 48000)
+            let mono48 = (raw.ndim > 1 ? raw.mean(axis: -1) : raw).asType(.float32).asArray(Float.self)
             try runner.start(mic: false)
-            FileHandle.standardError.write(Data("feeding \(wavPath) (\(String(format: "%.1f", Double(samples.count) / 16000))s) at real-time pace...\n".utf8))
-            runner.feedFileRealtime(samples)
+            FileHandle.standardError.write(Data(
+                "feeding \(wavPath) (\(String(format: "%.1f", Double(mono48.count) / 48000))s @48k)\(denoise ? " through ANE denoise" : "") at real-time pace...\n".utf8))
+            runner.feedFile48Realtime(mono48)
             runner.stop()
             return
         }
