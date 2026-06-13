@@ -20,13 +20,28 @@ import MLX
 // token timestamps.)
 
 public final class TwoTierSession {
-    private let fast: NemotronASRStreamSession      // instant partials, monotonic
+    // Fast lane as closures so it can be either MLX or CoreML/ANE Nemotron (the latter
+    // is #if-gated and a different type) without coupling this class to either.
+    private let fastStep: ([Float]) -> Void
+    private let fastText: () -> String
+    private let fastFinish: () -> Void
     private let accurate: VoxtralRealtimeStreamSession  // accurate finals, lags
 
-    public init(nemotron: NemotronASRModel, voxtral: VoxtralRealtimeModel,
-                language: String? = nil, fastChunkMs: Int = 80) {
-        self.fast = nemotron.makeStreamSession(language: language, chunkMs: fastChunkMs)
+    /// Designated init: caller supplies the fast lane (MLX or ANE Nemotron) as closures.
+    public init(fastStep: @escaping ([Float]) -> Void, fastText: @escaping () -> String,
+                fastFinish: @escaping () -> Void, voxtral: VoxtralRealtimeModel) {
+        self.fastStep = fastStep
+        self.fastText = fastText
+        self.fastFinish = fastFinish
         self.accurate = voxtral.makeStreamSession()
+    }
+
+    /// Convenience: MLX Nemotron fast lane.
+    public convenience init(nemotron: NemotronASRModel, voxtral: VoxtralRealtimeModel,
+                            language: String? = nil, fastChunkMs: Int = 80) {
+        let f = nemotron.makeStreamSession(language: language, chunkMs: fastChunkMs)
+        self.init(fastStep: { _ = f.step($0) }, fastText: { f.text }, fastFinish: { _ = f.finish() },
+                  voxtral: voxtral)
     }
 
     /// Accurate (Voxtral) text covered so far — not revised once Voxtral commits it.
@@ -35,7 +50,7 @@ public final class TwoTierSession {
     /// Instant (Nemotron) tail beyond Voxtral's coverage — provisional, to be replaced.
     public var partial: String {
         let conf = Self.words(accurate.text)
-        let fastW = Self.words(fast.text)
+        let fastW = Self.words(fastText())
         return fastW.count > conf.count ? fastW[conf.count...].joined(separator: " ") : ""
     }
 
@@ -48,7 +63,7 @@ public final class TwoTierSession {
 
     @discardableResult
     public func step(_ samples: [Float]) -> (confirmed: String, partial: String) {
-        _ = fast.step(samples)
+        fastStep(samples)
         _ = accurate.step(samples)
         let (c, p) = (confirmed, partial)
         if debug { steps += 1; if steps % 12 == 0 {
@@ -61,7 +76,7 @@ public final class TwoTierSession {
     /// final transcript (the partial tail is subsumed once Voxtral catches up).
     @discardableResult
     public func finish() -> (confirmed: String, partial: String) {
-        _ = fast.finish()
+        fastFinish()
         _ = accurate.finish()
         return (accurate.text, "")
     }

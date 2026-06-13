@@ -381,6 +381,19 @@ struct MicCompare {
             providers.append(LocalASR(label: "NEMOTRON 0.6b \(quant(nemoRepo)) (\(chunkMs.map { "\($0)ms" } ?? "native"))",
                                       gated: false, step: { s.step($0); return s.text }, finish: { _ = s.finish(); return s.text }))
         }
+        if wanted("nemotron-ane") {
+            #if canImport(CoreML)
+            FileHandle.standardError.write(Data("loading Nemotron CoreML/ANE encoder (HF download + compile on first run)...\n".utf8))
+            let m = try await NemotronASRModel.fromPretrained(nemoRepo)
+            do {
+                let s = try await NemotronCoreMLStreamSession.create(model: m)
+                providers.append(LocalASR(label: "NEMOTRON ANE (CoreML enc)", gated: false,
+                                          step: { s.step($0) }, finish: { s.finish() }))
+            } catch { FileHandle.standardError.write(Data("(Nemotron ANE unavailable: \(error) — skipping)\n".utf8)) }
+            #else
+            FileHandle.standardError.write(Data("(CoreML unavailable — skipping nemotron-ane)\n".utf8))
+            #endif
+        }
         if wanted("voxtral") {
             FileHandle.standardError.write(Data("loading voxtral...\n".utf8))
             let m = try await VoxtralRealtimeModel.fromPretrained(voxRepo)
@@ -409,6 +422,25 @@ struct MicCompare {
                 label: "TWO-TIER Nemotron→Voxtral", gated: vad != nil,
                 step: { let r = s.step($0); return r.confirmed + (r.partial.isEmpty ? "" : " ⟨\(r.partial)⟩") },
                 finish: { let r = s.finish(); return r.confirmed }))
+        }
+        if wanted("two-tier-ane") {
+            #if canImport(CoreML)
+            FileHandle.standardError.write(Data("loading two-tier ANE (Nemotron on ANE + Voxtral on GPU)...\n".utf8))
+            let nm = try await NemotronASRModel.fromPretrained(nemoRepo)
+            let vm = try await VoxtralRealtimeModel.fromPretrained(voxRepo)
+            let vw = vm.makeStreamSession(); _ = vw.step([Float](repeating: 0, count: 16000)); _ = vw.finish()
+            do {
+                let ane = try await NemotronCoreMLStreamSession.create(model: nm)
+                let s = TwoTierSession(fastStep: { _ = ane.step($0) }, fastText: { ane.text },
+                                       fastFinish: { _ = ane.finish() }, voxtral: vm)
+                providers.append(LocalASR(
+                    label: "TWO-TIER ANE Nemotron◇Voxtral", gated: vad != nil,
+                    step: { let r = s.step($0); return r.confirmed + (r.partial.isEmpty ? "" : " ⟨\(r.partial)⟩") },
+                    finish: { let r = s.finish(); return r.confirmed }))
+            } catch { FileHandle.standardError.write(Data("(two-tier ANE unavailable: \(error) — skipping)\n".utf8)) }
+            #else
+            FileHandle.standardError.write(Data("(CoreML unavailable — skipping two-tier-ane)\n".utf8))
+            #endif
         }
         if wanted("apple") {
             if #available(macOS 26.0, iOS 26.0, *) {
