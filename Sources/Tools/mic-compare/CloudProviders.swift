@@ -21,7 +21,7 @@ private extension Data {
 // MARK: - DeepGram (Nova-2 streaming; Russian supported)
 
 final class DeepgramASR: LiveASR {
-    let label = "DEEPGRAM nova-2 (cloud)"
+    let label: String
     let isLocal = false
     private let lock = NSLock()
     private var snap: Snap
@@ -33,6 +33,7 @@ final class DeepgramASR: LiveASR {
     private var firstText = -1.0
 
     init(key: String, language: String, model: String = "nova-2") {
+        label = "DEEPGRAM \(model) (cloud)"
         snap = Snap(label: label, note: "cloud")
         var comps = URLComponents(string: "wss://api.deepgram.com/v1/listen")!
         comps.queryItems = [
