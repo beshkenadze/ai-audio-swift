@@ -1,19 +1,21 @@
-# mic-compare showcase: on-device two-tier (Nemotron ANE + Voxtral GPU) vs cloud DeepGram
-# Records the live column HUD; model-load is hidden so the GIF is just the transcription.
+# mic-compare showcase — 3 engines, ~55s. Fully auto-synced via Wait:
+#   Show fires when the live HUD appears (load done), recording ends after the
+#   COMPARISON panel renders (feed done) — independent of load time & feed length.
 Output showcase.gif
 Output showcase.mp4
 
 Set Shell "zsh"
-Set FontSize 15
-Set Width 1500
-Set Height 760
-Set Padding 18
+Set FontSize 14
+Set Width 1900
+Set Height 900
+Set Padding 16
 
 Hide
 Type "cd /Volumes/DATA/mlx-audio-swift-worktrees/nemotron-session && B=.build/arm64-apple-macosx/release/mic-compare"
 Enter
-Type "$B --language en --wav demo/clip22.wav --only two-tier-ane,deepgram --cloud --dg-model nova-3"
+Type "$B --language en --wav demo/clip55.wav --only two-tier-ane,deepgram,gemini --cloud --dg-model nova-3"
 Enter
-Sleep 14s
+Wait+Screen@60s /TWO-TIER/
 Show
-Sleep 26s
+Wait+Screen@90s /COMPARISON/
+Sleep 4s
