@@ -419,7 +419,7 @@ struct MicCompare {
             let vm = try await VoxtralRealtimeModel.fromPretrained(voxRepo)
             let nw = nm.makeStreamSession(language: language, chunkMs: 80); _ = nw.step([Float](repeating: 0, count: 16000)); _ = nw.finish()
             let vw = vm.makeStreamSession(); _ = vw.step([Float](repeating: 0, count: 16000)); _ = vw.finish()
-            let s = TwoTierSession(nemotron: nm, voxtral: vm, language: language, fastChunkMs: 80, voxtralDelayMs: voxDelay)
+            let s = TwoTierSession(nemotron: nm, voxtral: vm, language: language, fastChunkMs: 80, voxtralDelayMs: voxDelay ?? 960)
             providers.append(LocalASR(
                 label: "TWO-TIER Nemotron→Voxtral", gated: vad != nil,
                 step: { let r = s.step($0); return r.confirmed + (r.partial.isEmpty ? "" : " ⟨\(r.partial)⟩") },
@@ -434,7 +434,7 @@ struct MicCompare {
             do {
                 let ane = try await NemotronCoreMLStreamSession.create(model: nm)
                 let s = TwoTierSession(fastStep: { _ = ane.step($0) }, fastText: { ane.text },
-                                       fastFinish: { _ = ane.finish() }, voxtral: vm, voxtralDelayMs: voxDelay)
+                                       fastFinish: { _ = ane.finish() }, voxtral: vm, voxtralDelayMs: voxDelay ?? 960)
                 providers.append(LocalASR(
                     label: "TWO-TIER ANE Nemotron◇Voxtral", gated: vad != nil,
                     step: { let r = s.step($0); return r.confirmed + (r.partial.isEmpty ? "" : " ⟨\(r.partial)⟩") },

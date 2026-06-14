@@ -33,7 +33,7 @@ public final class TwoTierSession {
     /// finals "for free". nil = the model's default (480 ms).
     public init(fastStep: @escaping ([Float]) -> Void, fastText: @escaping () -> String,
                 fastFinish: @escaping () -> Void, voxtral: VoxtralRealtimeModel,
-                voxtralDelayMs: Int? = nil) {
+                voxtralDelayMs: Int? = 960) {   // 960ms = accuracy sweet spot; partials hide it
         self.fastStep = fastStep
         self.fastText = fastText
         self.fastFinish = fastFinish
@@ -42,7 +42,7 @@ public final class TwoTierSession {
 
     /// Convenience: MLX Nemotron fast lane.
     public convenience init(nemotron: NemotronASRModel, voxtral: VoxtralRealtimeModel,
-                            language: String? = nil, fastChunkMs: Int = 80, voxtralDelayMs: Int? = nil) {
+                            language: String? = nil, fastChunkMs: Int = 80, voxtralDelayMs: Int? = 960) {
         let f = nemotron.makeStreamSession(language: language, chunkMs: fastChunkMs)
         self.init(fastStep: { _ = f.step($0) }, fastText: { f.text }, fastFinish: { _ = f.finish() },
                   voxtral: voxtral, voxtralDelayMs: voxtralDelayMs)
