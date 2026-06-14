@@ -317,6 +317,7 @@ struct MicCompare {
         var denoise = false
         var dfnModel = "standard"
         var denoiserKind = "dfn"   // dfn | dpdfnet
+        var voxDelay: Int? = nil   // Voxtral transcription delay ms (160/240/480/960/2400); nil = default 480
 
         var it = CommandLine.arguments.dropFirst().makeIterator()
         while let a = it.next() {
@@ -339,6 +340,7 @@ struct MicCompare {
             case "--denoise": denoise = true    // ANE denoise (mic + --wav, same path)
             case "--dfn-model": dfnModel = it.next() ?? dfnModel  // standard|enhanced|v2b|v2b_n4|v2b_n4_4bit
             case "--denoiser": denoiserKind = (it.next() ?? denoiserKind).lowercased()  // dfn | dpdfnet
+            case "--vox-delay": voxDelay = Int(it.next() ?? "")  // Voxtral delay ms (160/240/480/960/2400)
             case "--list-devices":
                 let def = AudioDevices.defaultInput()
                 for d in AudioDevices.inputs() { print("\(d.name)\(d.id == def ? " (default)" : "")\n    uid: \(d.uid)") }
@@ -398,8 +400,8 @@ struct MicCompare {
             FileHandle.standardError.write(Data("loading voxtral...\n".utf8))
             let m = try await VoxtralRealtimeModel.fromPretrained(voxRepo)
             let w = m.makeStreamSession(); _ = w.step([Float](repeating: 0, count: 16000 * 2)); _ = w.finish()
-            let s = m.makeStreamSession()
-            providers.append(LocalASR(label: "VOXTRAL 4B \(quant(voxRepo)) (480ms)",
+            let s = m.makeStreamSession(transcriptionDelayMs: voxDelay)
+            providers.append(LocalASR(label: "VOXTRAL 4B \(quant(voxRepo)) (\(voxDelay ?? 480)ms)",
                                       gated: vad != nil, step: { s.step($0); return s.text }, finish: { _ = s.finish(); return s.text }))
         }
         if wanted("voxtral-la") {
@@ -417,7 +419,7 @@ struct MicCompare {
             let vm = try await VoxtralRealtimeModel.fromPretrained(voxRepo)
             let nw = nm.makeStreamSession(language: language, chunkMs: 80); _ = nw.step([Float](repeating: 0, count: 16000)); _ = nw.finish()
             let vw = vm.makeStreamSession(); _ = vw.step([Float](repeating: 0, count: 16000)); _ = vw.finish()
-            let s = TwoTierSession(nemotron: nm, voxtral: vm, language: language, fastChunkMs: 80)
+            let s = TwoTierSession(nemotron: nm, voxtral: vm, language: language, fastChunkMs: 80, voxtralDelayMs: voxDelay)
             providers.append(LocalASR(
                 label: "TWO-TIER Nemotron→Voxtral", gated: vad != nil,
                 step: { let r = s.step($0); return r.confirmed + (r.partial.isEmpty ? "" : " ⟨\(r.partial)⟩") },
@@ -432,7 +434,7 @@ struct MicCompare {
             do {
                 let ane = try await NemotronCoreMLStreamSession.create(model: nm)
                 let s = TwoTierSession(fastStep: { _ = ane.step($0) }, fastText: { ane.text },
-                                       fastFinish: { _ = ane.finish() }, voxtral: vm)
+                                       fastFinish: { _ = ane.finish() }, voxtral: vm, voxtralDelayMs: voxDelay)
                 providers.append(LocalASR(
                     label: "TWO-TIER ANE Nemotron◇Voxtral", gated: vad != nil,
                     step: { let r = s.step($0); return r.confirmed + (r.partial.isEmpty ? "" : " ⟨\(r.partial)⟩") },

@@ -28,20 +28,24 @@ public final class TwoTierSession {
     private let accurate: VoxtralRealtimeStreamSession  // accurate finals, lags
 
     /// Designated init: caller supplies the fast lane (MLX or ANE Nemotron) as closures.
+    /// `voxtralDelayMs` trades latency for accuracy on the accurate lane — and because
+    /// the fast lane hides that latency, a larger delay (e.g. 960 ms) buys near-offline
+    /// finals "for free". nil = the model's default (480 ms).
     public init(fastStep: @escaping ([Float]) -> Void, fastText: @escaping () -> String,
-                fastFinish: @escaping () -> Void, voxtral: VoxtralRealtimeModel) {
+                fastFinish: @escaping () -> Void, voxtral: VoxtralRealtimeModel,
+                voxtralDelayMs: Int? = nil) {
         self.fastStep = fastStep
         self.fastText = fastText
         self.fastFinish = fastFinish
-        self.accurate = voxtral.makeStreamSession()
+        self.accurate = voxtral.makeStreamSession(transcriptionDelayMs: voxtralDelayMs)
     }
 
     /// Convenience: MLX Nemotron fast lane.
     public convenience init(nemotron: NemotronASRModel, voxtral: VoxtralRealtimeModel,
-                            language: String? = nil, fastChunkMs: Int = 80) {
+                            language: String? = nil, fastChunkMs: Int = 80, voxtralDelayMs: Int? = nil) {
         let f = nemotron.makeStreamSession(language: language, chunkMs: fastChunkMs)
         self.init(fastStep: { _ = f.step($0) }, fastText: { f.text }, fastFinish: { _ = f.finish() },
-                  voxtral: voxtral)
+                  voxtral: voxtral, voxtralDelayMs: voxtralDelayMs)
     }
 
     /// Accurate (Voxtral) text covered so far — not revised once Voxtral commits it.
