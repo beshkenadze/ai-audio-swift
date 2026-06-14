@@ -31,6 +31,7 @@ final class DeepgramASR: LiveASR {
     private var lastWallNow = 0.0
     private var speechWall = -1.0
     private var firstText = -1.0
+    private var closing = false   // clean end-of-stream close — not a real disconnect
 
     init(key: String, language: String, model: String = "nova-2") {
         label = "DEEPGRAM \(model) (cloud)"
@@ -63,7 +64,7 @@ final class DeepgramASR: LiveASR {
             guard let self else { return }
             switch result {
             case .failure:
-                self.lock.lock(); self.snap.note = "cloud · disconnected"; self.lock.unlock()
+                self.lock.lock(); if !self.closing { self.snap.note = "cloud · disconnected" }; self.lock.unlock()
             case .success(let msg):
                 switch msg {
                 case .string(let s): self.handle(s)
@@ -98,7 +99,9 @@ final class DeepgramASR: LiveASR {
     }
 
     func finish() {
+        lock.lock(); closing = true; lock.unlock()
         task?.send(.string("{\"type\":\"CloseStream\"}")) { _ in }
+        Thread.sleep(forTimeInterval: 0.8)   // let DeepGram finalize the tail before we close
         task?.cancel(with: .goingAway, reason: nil)
     }
 

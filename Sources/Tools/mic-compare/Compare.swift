@@ -67,26 +67,47 @@ private struct HUD {
         return Array(lines.suffix(maxLines))
     }
 
+    /// Pad/truncate to an exact display width (plain text → char count == columns).
+    private func cell(_ s: String, _ w: Int) -> String {
+        let t = s.count > w ? String(s.prefix(w)) : s
+        return t + String(repeating: " ", count: max(0, w - t.count))
+    }
+
+    /// Side-by-side columns (one per engine), each a fixed width so growth in one
+    /// column never reflows the others — no more stacked rows jittering.
     func render(_ snaps: [Snap], vad: (on: Bool, active: Bool, prob: Float)?) {
         guard isTTY else { return }
         let (cols, rows) = size()
-        var out = "\u{1B}[H\u{1B}[2J"
-        var budget = rows - 1
+        let eol = "\u{1B}[K\n"   // erase-to-EOL: redraw in place without a flickery full clear
+        var out = "\u{1B}[H"
+        var top = rows - 1
         if let vad, vad.on {
-            out += String(format: " VAD %@  p=%.2f\n", vad.active ? "● SPEECH" : "○ silence", vad.prob)
-            budget -= 1
+            out += String(format: " VAD %@  p=%.2f", vad.active ? "● SPEECH" : "○ silence", vad.prob) + eol
+            top -= 1
         }
-        let body = max(1, (budget - snaps.count) / max(1, snaps.count))
+        let n = max(1, snaps.count)
+        let sep = " │ "
+        let colW = max(12, (cols - (n - 1) * sep.count) / n)
+        let bodyH = max(1, top - 2)   // 2 header rows (label + metrics)
+
+        var labelRow: [String] = [], metaRow: [String] = [], bodies: [[String]] = []
         for s in snaps {
+            labelRow.append(cell(s.label, colW))
             let ttft = s.ttft >= 0 ? String(format: "%.2fs", s.ttft) : "—"
             let lag = s.lag >= 0 ? String(format: "%.2fs", s.lag) : "—"
             let words = s.text.split(whereSeparator: \.isWhitespace).count
-            var head = " \(s.label)  ttft \(ttft) · lag \(lag) · words \(words)"
-            if !s.perf.isEmpty { head += " · \(s.perf)" }
-            if !s.note.isEmpty { head += " · \(s.note)" }
-            out += "\u{1B}[7m" + head.padding(toLength: min(cols, max(head.count, cols)), withPad: " ", startingAt: 0) + "\u{1B}[0m\n"
-            for l in wrap(s.text.isEmpty ? "…" : s.text, width: cols - 1, maxLines: body) { out += l + "\n" }
+            var meta = "ttft \(ttft)·lag \(lag)·\(words)w"
+            if !s.perf.isEmpty { meta += "·\(s.perf)" }
+            if !s.note.isEmpty { meta += "·\(s.note)" }
+            metaRow.append(cell(meta, colW))
+            var lines = wrap(s.text.isEmpty ? "…" : s.text, width: colW, maxLines: bodyH)
+            while lines.count < bodyH { lines.append("") }
+            bodies.append(lines.map { cell($0, colW) })
         }
+        out += "\u{1B}[7m" + labelRow.joined(separator: sep) + "\u{1B}[0m" + eol   // inverted header
+        out += "\u{1B}[2m" + metaRow.joined(separator: sep) + "\u{1B}[0m" + eol    // dim metrics
+        for r in 0..<bodyH { out += bodies.map { $0[r] }.joined(separator: sep) + eol }
+        out += "\u{1B}[J"   // clear anything below the grid (e.g. after a resize)
         write(out)
     }
 }
@@ -282,13 +303,50 @@ private final class CompareRunner: @unchecked Sendable {
     }
 
     private func printSummary() {
-        let snaps = providers.map { $0.snapshot() }
-        var out = "\n══════════════ COMPARISON ══════════════\n"
-        for s in snaps {
+        let items = providers.map { ($0, $0.snapshot()) }
+
+        // Piped/scripted (stderr not a TTY): plain, parseable — keep `=== label ===`.
+        guard isatty(STDERR_FILENO) != 0 else {
+            var out = "\n══════════════ COMPARISON ══════════════\n"
+            for (_, s) in items {
+                let ttft = s.ttft >= 0 ? String(format: "%.2fs", s.ttft) : "—"
+                let lag = s.lag >= 0 ? String(format: "%.2fs", s.lag) : "—"
+                out += "\n=== \(s.label) ===  ttft \(ttft) · lag \(lag)\(s.perf.isEmpty ? "" : " · \(s.perf)")\n\(s.text)\n"
+            }
+            FileHandle.standardError.write(Data(out.utf8))
+            return
+        }
+
+        // TTY: boxed, colored panels (cyan = on-device, yellow = cloud).
+        var w = winsize()
+        let cols = (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == 0 && w.ws_col > 0) ? min(Int(w.ws_col), 110) : 100
+        let textW = max(24, cols - 6)
+        func wrapP(_ t: String) -> [String] {
+            var ls: [String] = []; var c = ""
+            for word in t.split(separator: " ") {
+                if c.isEmpty { c = String(word) }
+                else if c.count + 1 + word.count <= textW { c += " " + word }
+                else { ls.append(c); c = String(word) }
+            }
+            if !c.isEmpty { ls.append(c) }
+            return ls
+        }
+        var out = "\u{1B}[2J\u{1B}[H\u{1B}[1;36m╭─ COMPARISON " + String(repeating: "─", count: max(0, cols - 15)) + "╮\u{1B}[0m\n"
+        for (p, s) in items {
+            let accent = p.isLocal ? "\u{1B}[1;36m" : "\u{1B}[1;33m"   // cyan local · yellow cloud
+            let badge = p.isLocal ? "on-device" : "cloud"
             let ttft = s.ttft >= 0 ? String(format: "%.2fs", s.ttft) : "—"
             let lag = s.lag >= 0 ? String(format: "%.2fs", s.lag) : "—"
-            out += "\n=== \(s.label) ===  ttft \(ttft) · lag \(lag)\(s.perf.isEmpty ? "" : " · \(s.perf)")\n\(s.text)\n"
+            var meta = "ttft \(ttft) · lag \(lag)"
+            if !s.perf.isEmpty { meta += " · \(s.perf)" }
+            if !s.note.isEmpty { meta += " · \(s.note)" }
+            out += "\n \(accent)▸ \(s.label)\u{1B}[0m \u{1B}[2m[\(badge)]\u{1B}[0m\n"
+            out += "   \u{1B}[2m\(meta)\u{1B}[0m\n"
+            out += "   \u{1B}[2m┌" + String(repeating: "─", count: textW + 1) + "\u{1B}[0m\n"
+            for l in wrapP(s.text.isEmpty ? "…" : s.text) { out += "   \u{1B}[2m│\u{1B}[0m \(l)\n" }
+            out += "   \u{1B}[2m└" + String(repeating: "─", count: textW + 1) + "\u{1B}[0m\n"
         }
+        out += "\u{1B}[1;36m╰" + String(repeating: "─", count: cols - 2) + "╯\u{1B}[0m\n"
         FileHandle.standardError.write(Data(out.utf8))
     }
 }
