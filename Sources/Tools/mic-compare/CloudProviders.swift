@@ -122,6 +122,7 @@ final class GeminiASR: LiveASR {
     private var lastWallNow = 0.0
     private var speechWall = -1.0
     private var firstText = -1.0
+    private var closing = false   // clean end-of-stream close — not a real disconnect
 
     init(key: String, model: String) {
         snap = Snap(label: label, note: "cloud")
@@ -181,7 +182,7 @@ final class GeminiASR: LiveASR {
             switch result {
             case .failure(let e):
                 self.dbg("FAILURE: \(e)")
-                self.lock.lock(); self.snap.note = "cloud · disconnected"; self.lock.unlock()
+                self.lock.lock(); if !self.closing { self.snap.note = "cloud · disconnected" }; self.lock.unlock()
             case .success(let msg):
                 switch msg {
                 case .string(let s): self.handle(s)
@@ -213,6 +214,10 @@ final class GeminiASR: LiveASR {
         lock.unlock()
     }
 
-    func finish() { task?.cancel(with: .goingAway, reason: nil) }
+    func finish() {
+        lock.lock(); closing = true; lock.unlock()
+        Thread.sleep(forTimeInterval: 0.6)   // let the last inputTranscription arrive
+        task?.cancel(with: .goingAway, reason: nil)
+    }
     func snapshot() -> Snap { lock.lock(); defer { lock.unlock() }; return snap }
 }
