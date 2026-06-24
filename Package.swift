@@ -57,6 +57,10 @@ let package = Package(
             name: "mlx-audio-swift-lid",
             targets: ["mlx-audio-swift-lid"],
         ),
+        .executable(
+            name: "mlx-audio-swift-diar",
+            targets: ["mlx-audio-swift-diar"],
+        ),
 
     ],
     dependencies: [
@@ -269,6 +273,14 @@ let package = Package(
             name: "mlx-audio-swift-lid",
             dependencies: ["MLXAudioCore", "MLXAudioLID"],
             path: "Sources/Tools/mlx-audio-swift-lid",
+            exclude: [
+                "README.md",
+            ]
+        ),
+        .executableTarget(
+            name: "mlx-audio-swift-diar",
+            dependencies: ["MLXAudioCore", "MLXAudioVAD"],
+            path: "Sources/Tools/mlx-audio-swift-diar",
             exclude: [
                 "README.md",
             ]

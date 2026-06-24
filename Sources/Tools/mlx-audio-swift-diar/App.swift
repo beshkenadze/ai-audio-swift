@@ -1,0 +1,529 @@
+import AVFoundation
+import Foundation
+@preconcurrency import MLX
+import MLXAudioCore
+import MLXAudioVAD
+
+// MARK: - Errors
+
+enum AppError: Error, LocalizedError, CustomStringConvertible {
+    case inputFileNotFound(String)
+    case mlxRuntimeNotConfigured(String)
+    case audioConverterUnavailable(String)
+    case audioReadFailed(String)
+
+    var errorDescription: String? { description }
+
+    var description: String {
+        switch self {
+        case .inputFileNotFound(let path):
+            "Input audio file not found: \(path)"
+        case .mlxRuntimeNotConfigured(let detail):
+            "MLX command-line runtime is not configured: \(detail)"
+        case .audioConverterUnavailable(let detail):
+            "Could not create the AVAudioConverter: \(detail)"
+        case .audioReadFailed(let detail):
+            "Failed to read audio: \(detail)"
+        }
+    }
+}
+
+enum CLIError: Error, CustomStringConvertible {
+    case missingValue(String)
+    case unknownOption(String)
+    case invalidValue(String, String)
+
+    var description: String {
+        switch self {
+        case .missingValue(let key):
+            "Missing value for \(key)"
+        case .unknownOption(let key):
+            "Unknown option \(key)"
+        case .invalidValue(let key, let value):
+            "Invalid value for \(key): \(value)"
+        }
+    }
+}
+
+// MARK: - CLI
+
+struct CLI {
+    let inputPath: String
+    let repo: String
+    let chunkDuration: Float
+    let threshold: Float
+    let rttmOut: String?
+    let maxSeconds: Double?
+    let verbose: Bool
+
+    static func parse() throws -> CLI {
+        try parse(Array(CommandLine.arguments.dropFirst()))
+    }
+
+    static func parse(_ arguments: [String]) throws -> CLI {
+        var inputPath: String?
+        var repo = "mlx-community/diar_streaming_sortformer_4spk-v2.1-fp16"
+        var chunkDuration: Float = 15.0
+        var threshold: Float = 0.5
+        var rttmOut: String?
+        var maxSeconds: Double?
+        var verbose = false
+
+        var iterator = arguments.makeIterator()
+        while let arg = iterator.next() {
+            switch arg {
+            case "--input", "-i":
+                guard let value = iterator.next() else { throw CLIError.missingValue(arg) }
+                inputPath = value
+            case "--repo":
+                guard let value = iterator.next() else { throw CLIError.missingValue(arg) }
+                repo = value
+            case "--chunk-duration":
+                guard let value = iterator.next() else { throw CLIError.missingValue(arg) }
+                guard let parsed = Float(value), parsed > 0 else { throw CLIError.invalidValue(arg, value) }
+                chunkDuration = parsed
+            case "--threshold":
+                guard let value = iterator.next() else { throw CLIError.missingValue(arg) }
+                guard let parsed = Float(value), parsed >= 0, parsed <= 1 else { throw CLIError.invalidValue(arg, value) }
+                threshold = parsed
+            case "--rttm-out":
+                guard let value = iterator.next() else { throw CLIError.missingValue(arg) }
+                rttmOut = value
+            case "--max-seconds":
+                guard let value = iterator.next() else { throw CLIError.missingValue(arg) }
+                guard let parsed = Double(value), parsed > 0 else { throw CLIError.invalidValue(arg, value) }
+                maxSeconds = parsed
+            case "--verbose", "-v":
+                verbose = true
+            case "--help", "-h":
+                printUsage()
+                exit(0)
+            default:
+                if inputPath == nil, !arg.hasPrefix("-") {
+                    inputPath = arg
+                } else {
+                    throw CLIError.unknownOption(arg)
+                }
+            }
+        }
+
+        guard let finalInput = inputPath, !finalInput.isEmpty else {
+            throw CLIError.missingValue("--input")
+        }
+
+        return CLI(
+            inputPath: finalInput,
+            repo: repo,
+            chunkDuration: chunkDuration,
+            threshold: threshold,
+            rttmOut: rttmOut,
+            maxSeconds: maxSeconds,
+            verbose: verbose
+        )
+    }
+
+    static func printUsage() {
+        let executable = (CommandLine.arguments.first as NSString?)?.lastPathComponent ?? "mlx-audio-swift-diar"
+        print(
+            """
+            Usage:
+              \(executable) --input <path> [options]
+
+            Description:
+              Memory-bounded long-form streaming speaker diarization using the Sortformer
+              model. Decodes/resamples the input incrementally (AVAudioFile + AVAudioConverter
+              to 16 kHz mono Float32) and drives SortformerModel.generateStreamBounded, so peak
+              memory and per-chunk latency stay flat regardless of file duration.
+
+            Options:
+              --input, -i <path>         Input audio file (required, any format AVFoundation reads)
+              --repo <id>                Hugging Face repo id.
+                                         Default: mlx-community/diar_streaming_sortformer_4spk-v2.1-fp16
+              --chunk-duration <sec>     Streaming step size in seconds. Default: 15
+              --threshold <f>            Speaker activity threshold in [0,1]. Default: 0.5
+              --rttm-out <path>          Optional path to write RTTM segments
+              --max-seconds <n>          Optional: stop feeding after N seconds of audio (smoke runs)
+              --verbose, -v              Print per-chunk progress
+              --help, -h                 Show this help
+
+            Examples:
+              \(executable) --input recording.flac --rttm-out out.rttm
+              \(executable) --input recording.flac --max-seconds 60 --chunk-duration 15 --verbose
+            """
+        )
+    }
+}
+
+// MARK: - Windowed audio reader (pull closure)
+
+/// Decodes an audio file incrementally into fixed-size 16 kHz mono Float32 blocks via a
+/// persistent `AVAudioConverter`. The converter is created once and fed through its input
+/// block so its resampling state stays continuous across pulls; only one native window plus
+/// one output block live in memory at a time.
+final class WindowedAudioReader: @unchecked Sendable {
+    private let file: AVAudioFile
+    private let converter: AVAudioConverter
+    private let inputBuffer: AVAudioPCMBuffer
+    private let outputBuffer: AVAudioPCMBuffer
+    private let outputBlockFrames: AVAudioFrameCount
+    private let nativeWindowFrames: AVAudioFrameCount
+
+    private var fileExhausted = false   // no more native frames left to read from the file
+    private var converterDrained = false // converter reported endOfStream and produced nothing more
+
+    /// - Parameters:
+    ///   - url: input file
+    ///   - targetSampleRate: output sample rate (16 kHz for Sortformer)
+    ///   - outputBlockSeconds: size of each pulled output block (default 1.0 s)
+    init(url: URL, targetSampleRate: Double = 16000, outputBlockSeconds: Double = 1.0) throws {
+        let file = try AVAudioFile(forReading: url)
+        self.file = file
+        let inputFormat = file.processingFormat
+
+        guard let outputFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: targetSampleRate,
+            channels: 1,
+            interleaved: false
+        ) else {
+            throw AppError.audioConverterUnavailable("could not build 16 kHz mono Float32 output format")
+        }
+
+        guard let converter = AVAudioConverter(from: inputFormat, to: outputFormat) else {
+            throw AppError.audioConverterUnavailable(
+                "AVAudioConverter(from: \(inputFormat), to: \(outputFormat)) returned nil"
+            )
+        }
+        self.converter = converter
+
+        self.outputBlockFrames = AVAudioFrameCount(max(1.0, outputBlockSeconds * targetSampleRate))
+        guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: outputBlockFrames) else {
+            throw AppError.audioConverterUnavailable("could not allocate output PCM buffer")
+        }
+        self.outputBuffer = outputBuffer
+
+        // Native window sized to roughly match each output block (in input sample-rate frames),
+        // so the converter rarely starves mid-block. The converter pulls more via its input
+        // block as needed; this is just a buffering granularity.
+        let ratio = inputFormat.sampleRate / targetSampleRate
+        self.nativeWindowFrames = AVAudioFrameCount(max(1.0, Double(outputBlockFrames) * ratio))
+        guard let inputBuffer = AVAudioPCMBuffer(pcmFormat: inputFormat, frameCapacity: nativeWindowFrames) else {
+            throw AppError.audioConverterUnavailable("could not allocate input PCM buffer")
+        }
+        self.inputBuffer = inputBuffer
+    }
+
+    /// Pull the next 16 kHz mono block. Returns nil at end-of-stream.
+    func next() throws -> [Float]? {
+        if converterDrained { return nil }
+
+        outputBuffer.frameLength = 0
+        var conversionError: NSError?
+
+        let status = converter.convert(to: outputBuffer, error: &conversionError) { [self] _, outStatus in
+            // Input block: read the next native window from the file. Signals endOfStream once
+            // the file is exhausted, so the converter flushes any buffered tail.
+            if fileExhausted {
+                outStatus.pointee = .endOfStream
+                return nil
+            }
+            do {
+                inputBuffer.frameLength = 0
+                try file.read(into: inputBuffer, frameCount: nativeWindowFrames)
+            } catch {
+                // Surface read failures by ending the stream; the outer convert() returns and
+                // we treat it as drained (the error itself is non-fatal flush behaviour).
+                fileExhausted = true
+                outStatus.pointee = .endOfStream
+                return nil
+            }
+            if inputBuffer.frameLength == 0 {
+                fileExhausted = true
+                outStatus.pointee = .endOfStream
+                return nil
+            }
+            outStatus.pointee = .haveData
+            return inputBuffer
+        }
+
+        if let conversionError {
+            throw AppError.audioReadFailed(conversionError.localizedDescription)
+        }
+
+        let produced = Int(outputBuffer.frameLength)
+        if status == .endOfStream {
+            converterDrained = true
+            if produced == 0 { return nil }
+        }
+        if produced == 0 {
+            // No frames this call but not end-of-stream (e.g. .inputRanDry transient): nil only if
+            // truly drained, otherwise an empty block keeps the caller's pull loop progressing.
+            return converterDrained ? nil : []
+        }
+
+        guard let channel = outputBuffer.floatChannelData?[0] else {
+            throw AppError.audioReadFailed("converter produced frames but floatChannelData was nil")
+        }
+        return Array(UnsafeBufferPointer(start: channel, count: produced))
+    }
+}
+
+// MARK: - Metrics helpers
+
+func currentResidentBytes() -> UInt64 {
+    var info = mach_task_basic_info()
+    var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size / MemoryLayout<natural_t>.size)
+    let kr = withUnsafeMutablePointer(to: &info) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+            task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+        }
+    }
+    return kr == KERN_SUCCESS ? info.resident_size : 0
+}
+
+func formatGB(_ bytes: UInt64) -> String {
+    String(format: "%.3f GB", Double(bytes) / 1_073_741_824.0)
+}
+
+func formatGB(_ bytes: Int) -> String {
+    String(format: "%.3f GB", Double(bytes) / 1_073_741_824.0)
+}
+
+func median(_ values: [Double]) -> Double {
+    guard !values.isEmpty else { return 0 }
+    let sorted = values.sorted()
+    let mid = sorted.count / 2
+    if sorted.count % 2 == 0 {
+        return (sorted[mid - 1] + sorted[mid]) / 2
+    }
+    return sorted[mid]
+}
+
+// MARK: - App
+
+@main
+enum App {
+    static func main() async {
+        // CRITICAL: cap MLX/Metal memory FIRST, before any MLXArray allocation. Uncapped MLX can
+        // OOM-reboot the machine. 18 GiB hard cap (project policy). See note below on the symbol.
+        capMLXMemory(bytes: 18 * 1024 * 1024 * 1024)
+
+        do {
+            let args = try CLI.parse()
+            try await run(args)
+        } catch {
+            fputs("Error: \(error)\n", stderr)
+            CLI.printUsage()
+            exit(1)
+        }
+    }
+
+    /// 18 GiB MLX/Metal hard cap.
+    ///
+    /// Symbol note: the installed mlx-swift (0.30.x) marks `GPU.set(memoryLimit:relaxed:)` as
+    /// *deprecated* (renamed to the `Memory.memoryLimit` property, which has no `relaxed:`
+    /// parameter — the limit is always strict / wait-on-malloc). We set the non-deprecated
+    /// `Memory.memoryLimit` to keep the build warning-clean; this is the strict cap the project
+    /// memory note's `relaxed: false` intended.
+    static func capMLXMemory(bytes: Int) {
+        MLX.Memory.memoryLimit = bytes
+    }
+
+    static func run(_ args: CLI) async throws {
+        let inputURL = resolveURL(path: args.inputPath)
+        guard FileManager.default.fileExists(atPath: inputURL.path) else {
+            throw AppError.inputFileNotFound(inputURL.path)
+        }
+
+        try ensureMLXRuntimeReadyForShell()
+
+        // Audio duration (for RTF) from the source file, capped by --max-seconds if set.
+        let probe = try AVAudioFile(forReading: inputURL)
+        let fileDurationSec = Double(probe.length) / probe.processingFormat.sampleRate
+        let audioDurationSec = args.maxSeconds.map { min($0, fileDurationSec) } ?? fileDurationSec
+
+        print("Loading Sortformer model (\(args.repo))")
+        let model = try await SortformerModel.fromPretrained(args.repo)
+
+        print("Opening audio (\(inputURL.path)) — \(String(format: "%.1f", fileDurationSec))s @ \(Int(probe.processingFormat.sampleRate)) Hz, \(probe.processingFormat.channelCount) ch")
+        let reader = try WindowedAudioReader(url: inputURL, targetSampleRate: 16000, outputBlockSeconds: 1.0)
+
+        // Bound the producer by --max-seconds (count of 16 kHz mono samples already pulled).
+        let sampleBudget: Int? = args.maxSeconds.map { Int($0 * 16000.0) }
+        let pulledSamples = Counter()
+
+        let audioSource: () async throws -> [Float]? = {
+            if let budget = sampleBudget, pulledSamples.value >= budget {
+                return nil
+            }
+            guard var block = try reader.next() else { return nil }
+            if let budget = sampleBudget {
+                let remaining = budget - pulledSamples.value
+                if remaining <= 0 { return nil }
+                if block.count > remaining {
+                    block = Array(block.prefix(remaining))
+                }
+            }
+            pulledSamples.add(block.count)
+            return block
+        }
+
+        print("Running bounded streaming diarization (chunk=\(args.chunkDuration)s, threshold=\(args.threshold))")
+
+        var allSegments: [DiarizationSegment] = []
+        var perChunkLatency: [Double] = []
+        var peakRSS: UInt64 = currentResidentBytes()
+
+        let wallStart = Date()
+        var lastTick = wallStart
+
+        for try await out in model.generateStreamBounded(
+            audioSource: audioSource,
+            sampleRate: 16000,
+            chunkDuration: args.chunkDuration,
+            threshold: args.threshold,
+            verbose: args.verbose
+        ) {
+            let now = Date()
+            perChunkLatency.append(now.timeIntervalSince(lastTick))
+            lastTick = now
+            allSegments.append(contentsOf: out.segments)
+            let rss = currentResidentBytes()
+            if rss > peakRSS { peakRSS = rss }
+        }
+
+        let wallSeconds = Date().timeIntervalSince(wallStart)
+        let mlxPeak = MLX.Memory.peakMemory
+
+        // RTTM out (concatenate per-chunk RTTM lines; reuse DiarizationOutput.text formatting).
+        if let rttmOut = args.rttmOut, !rttmOut.isEmpty {
+            let rttm = DiarizationOutput(segments: allSegments).text
+            let rttmURL = resolveURL(path: rttmOut)
+            try (rttm + "\n").write(to: rttmURL, atomically: true, encoding: .utf8)
+            print("Wrote RTTM (\(allSegments.count) segments) to \(rttmURL.path)")
+        }
+
+        printMetrics(
+            wallSeconds: wallSeconds,
+            audioDurationSec: audioDurationSec,
+            perChunkLatency: perChunkLatency,
+            segments: allSegments,
+            peakRSS: peakRSS,
+            mlxPeak: mlxPeak
+        )
+    }
+
+    static func printMetrics(
+        wallSeconds: Double,
+        audioDurationSec: Double,
+        perChunkLatency: [Double],
+        segments: [DiarizationSegment],
+        peakRSS: UInt64,
+        mlxPeak: Int
+    ) {
+        let speakers = Set(segments.map { $0.speaker })
+        let minLat = perChunkLatency.min() ?? 0
+        let maxLat = perChunkLatency.max() ?? 0
+        let medLat = median(perChunkLatency)
+        let first = perChunkLatency.first ?? 0
+        let last = perChunkLatency.last ?? 0
+        let trend: String
+        if first > 0 {
+            trend = String(format: "%.2fx (last/first)", last / first)
+        } else {
+            trend = "n/a"
+        }
+        let rtf = audioDurationSec > 0 ? wallSeconds / audioDurationSec : 0
+        let mlxPeakStr = mlxPeak > 0 ? formatGB(mlxPeak) : "n/a"
+
+        print("")
+        print("==================== Diarization Metrics ====================")
+        print(String(format: "Audio duration:        %.2f s", audioDurationSec))
+        print(String(format: "Total wall time:       %.2f s", wallSeconds))
+        print(String(format: "RTF (wall/audio):      %.3f", rtf))
+        print("Chunks processed:      \(perChunkLatency.count)")
+        print(String(format: "Per-chunk latency:     min %.3fs / median %.3fs / max %.3fs", minLat, medLat, maxLat))
+        print(String(format: "Latency trend:         first %.3fs -> last %.3fs  (%@)", first, last, trend))
+        print("Total segments:        \(segments.count)")
+        print("Distinct speakers:     \(speakers.count)  \(speakers.sorted())")
+        print("Peak process RSS:      \(formatGB(peakRSS))")
+        print("MLX peak memory:       \(mlxPeakStr)")
+        print("=============================================================")
+    }
+
+    private static func resolveURL(path: String) -> URL {
+        if path.hasPrefix("/") {
+            return URL(fileURLWithPath: path)
+        }
+        return URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(path)
+    }
+
+    // MARK: - MLX metallib discovery (mirrors mlx-audio-swift-lid)
+
+    static func ensureMLXRuntimeReadyForShell(
+        executableURL: URL? = CommandLine.arguments.first.map { URL(fileURLWithPath: $0) },
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) throws {
+        let searchRoots = runtimeSearchRoots(executableURL: executableURL, environment: environment)
+        let candidatePaths = metallibCandidates(searchRoots: searchRoots)
+
+        if candidatePaths.contains(where: { FileManager.default.fileExists(atPath: $0.path) }) {
+            return
+        }
+
+        let searchedPaths = candidatePaths.map(\.path).joined(separator: ", ")
+        throw AppError.mlxRuntimeNotConfigured(
+            """
+            could not find MLX metal resources near the executable or on DYLD_FRAMEWORK_PATH. \
+            Searched: \(searchedPaths). Run the tool from Xcode, or export DYLD_FRAMEWORK_PATH \
+            to the SwiftPM build directory before invoking the CLI.
+            """
+        )
+    }
+
+    private static func runtimeSearchRoots(
+        executableURL: URL?,
+        environment: [String: String]
+    ) -> [URL] {
+        var roots: [URL] = []
+
+        if let executableURL {
+            roots.append(executableURL.deletingLastPathComponent())
+        }
+
+        if let frameworkPath = environment["DYLD_FRAMEWORK_PATH"] {
+            for rawPath in frameworkPath.split(separator: ":") where !rawPath.isEmpty {
+                roots.append(URL(fileURLWithPath: String(rawPath)))
+            }
+        }
+
+        return roots
+    }
+
+    private static func metallibCandidates(searchRoots: [URL]) -> [URL] {
+        let suffixes = [
+            "default.metallib",
+            "mlx.metallib",
+            "Resources/default.metallib",
+            "Resources/mlx.metallib",
+            "mlx-swift_Cmlx.bundle/default.metallib",
+            "mlx-swift_Cmlx.bundle/mlx.metallib",
+            "mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib",
+            "mlx-swift_Cmlx.bundle/Contents/Resources/mlx.metallib",
+        ]
+
+        return searchRoots.flatMap { root in
+            suffixes.map { root.appendingPathComponent($0) }
+        }
+    }
+}
+
+/// Tiny mutable sample counter captured by reference into the pull closure.
+/// `generateStreamBounded` runs the closure serially on a single detached task, so no locking
+/// is required for correctness.
+final class Counter {
+    private var _value = 0
+    var value: Int { _value }
+    func add(_ n: Int) { _value += n }
+}
