@@ -1258,3 +1258,103 @@ struct BoundedWindowPlannerTests {
         #expect(spec.rawEnd <= totalSamples)
     }
 }
+
+// MARK: - PCM Accumulator (bounded buffer)
+
+struct PCMAccumulatorTests {
+
+    @Test func sliceSpansMultipleBlocks() {
+        var acc = PCMAccumulator()
+        acc.append([0, 1, 2])
+        acc.append([3, 4, 5])
+        acc.append([6, 7, 8])
+        // slice(2, 7) crosses all three blocks.
+        #expect(acc.slice(from: 2, to: 7) == [2, 3, 4, 5, 6])
+    }
+
+    /// Absolute addressing survives a drop: indices stay anchored to the whole stream, so a slice
+    /// of the kept tail still returns the right values. (Slicing below `k` would trap by contract —
+    /// asserted in a comment rather than crash-tested.)
+    @Test func absoluteAddressingSurvivesDrop() {
+        var acc = PCMAccumulator()
+        acc.append([10, 11, 12, 13, 14, 15, 16, 17, 18, 19])
+        let k = 4
+        acc.drop(beforeAbsolute: k)
+        #expect(acc.firstRetainedAbsolute == k)
+        // slice(4, 8) addresses the SAME absolute samples [14,15,16,17] as before the drop.
+        #expect(acc.slice(from: k, to: k + 4) == [14, 15, 16, 17])
+        // slice(from: k - 1, ...) would trap: samples before k are dropped. Contract-asserted only.
+    }
+
+    /// drop frees memory: retainedCount reflects only the kept tail, not the whole stream.
+    @Test func dropFreesMemory() {
+        var acc = PCMAccumulator()
+        acc.append(Array(repeating: 0, count: 100))
+        #expect(acc.retainedCount == 100)
+        acc.drop(beforeAbsolute: 70)
+        #expect(acc.retainedCount == 30, "only the tail [70,100) is retained")
+        #expect(acc.totalAppendedCount == 100, "total seen is unaffected by drops")
+    }
+
+    /// drop is idempotent and re-droppable: dropping at k, then again below/at k, must not corrupt
+    /// state; dropping nothing (index <= base) is a no-op.
+    @Test func dropIsIdempotentAndReDroppable() {
+        var acc = PCMAccumulator()
+        acc.append(Array((0..<20).map { Float($0) }))
+        acc.drop(beforeAbsolute: 8)
+        #expect(acc.firstRetainedAbsolute == 8)
+        #expect(acc.retainedCount == 12)
+
+        // Re-drop at the same index: no change.
+        acc.drop(beforeAbsolute: 8)
+        #expect(acc.firstRetainedAbsolute == 8)
+        #expect(acc.retainedCount == 12)
+
+        // Drop below the current base (already gone): no-op, no corruption.
+        acc.drop(beforeAbsolute: 3)
+        #expect(acc.firstRetainedAbsolute == 8)
+        #expect(acc.retainedCount == 12)
+
+        // Drop at 0 / negative: no-op.
+        acc.drop(beforeAbsolute: 0)
+        #expect(acc.firstRetainedAbsolute == 8)
+
+        // Data is still correct and absolute-addressed after the churn.
+        #expect(acc.slice(from: 8, to: 12) == [8, 9, 10, 11])
+    }
+
+    /// Bounded-memory scenario: mimic the Task-5 sliding loop — each iteration appends one step of
+    /// samples, slices a window (step + a left halo), then drops everything consumed below the next
+    /// step's halo. retainedCount must stay <= (step + halo) and NOT grow with the iteration count.
+    @Test func boundedMemoryAcrossManyIterations() {
+        let step = 1504   // C = chunkLen * subsamplingFactor (~15 s of mel-frame samples, scaled down)
+        let halo = 256     // left halo + STFT margin retained for the next window
+        var acc = PCMAccumulator()
+        var g0 = 0
+        var retainedHigh = 0
+
+        for i in 0..<50 {
+            // 1. Append one step of fresh PCM (values encode absolute index for slice correctness).
+            let block = (0..<step).map { Float(g0 + $0) }
+            acc.append(block)
+
+            // 2. Slice the window: left halo (clamped at stream start) + this step.
+            let winStart = max(0, g0 - halo)
+            let winEnd = g0 + step
+            let win = acc.slice(from: winStart, to: winEnd)
+            #expect(win.first == Float(winStart), "iter \(i): window starts at the right absolute sample")
+            #expect(win.last == Float(winEnd - 1), "iter \(i): window ends at the right absolute sample")
+
+            // 3. Advance, then drop everything the NEXT window won't need (keep only its left halo).
+            g0 += step
+            acc.drop(beforeAbsolute: max(0, g0 - halo))
+
+            retainedHigh = max(retainedHigh, acc.retainedCount)
+        }
+
+        // Memory is flat: bounded by one step + one halo, regardless of the 50 iterations / ~75k samples.
+        #expect(retainedHigh <= step + halo,
+                "retained memory must stay <= one step + halo (got \(retainedHigh))")
+        #expect(acc.totalAppendedCount == step * 50, "all samples were seen")
+    }
+}
