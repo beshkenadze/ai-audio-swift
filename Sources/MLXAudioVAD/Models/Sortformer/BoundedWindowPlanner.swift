@@ -44,7 +44,6 @@ public struct WindowSpec: Equatable, Sendable {
 public struct BoundedWindowPlanner: Equatable, Sendable {
     public let hop: Int
     public let nFft: Int
-    public let winLength: Int
     public let subsamplingFactor: Int
     /// Embedding frames per reference step (`chunkLen`, default 188).
     public let chunkLenEmb: Int
@@ -58,7 +57,6 @@ public struct BoundedWindowPlanner: Equatable, Sendable {
     public init(
         hop: Int,
         nFft: Int,
-        winLength: Int,
         subsamplingFactor: Int,
         chunkLenEmb: Int = 188,
         haloLeftMel: Int = 16,
@@ -67,7 +65,6 @@ public struct BoundedWindowPlanner: Equatable, Sendable {
     ) {
         self.hop = hop
         self.nFft = nFft
-        self.winLength = winLength
         self.subsamplingFactor = subsamplingFactor
         self.chunkLenEmb = chunkLenEmb
         self.haloLeftMel = haloLeftMel
@@ -105,13 +102,26 @@ public struct BoundedWindowPlanner: Equatable, Sendable {
     ///          When `false`, the right halo is still shrunk to what is currently available; the
     ///          caller is responsible for only stepping once enough samples (or EOF) are buffered.
     public func plan(g0: Int, totalKnownSamples: Int, eof: Bool) -> WindowSpec {
-        _ = eof // halo shrink is driven purely by available frames; flag documents intent
         let totalMel = totalMelFrames(forSamples: totalKnownSamples)
 
         // Halos shrink at the boundaries (left at the start, right at EOF / when little remains).
         let leftHalo = min(haloLeftMel, g0)
         let newMelFrames = max(0, min(stepMelFrames, totalMel - g0))
         let futureMel = totalMel - (g0 + newMelFrames)
+
+        // Mid-stream contract: when `eof == false` the caller asserts more audio is still coming,
+        // so the right halo (lookahead) must NOT be silently shrunk for lack of buffered frames.
+        // Shrinking it here would change the chunk's right-context embeddings vs. the full-file
+        // forward — a silent diarization-quality cliff. The Task-5 loop's pull-before-slice gate
+        // guarantees a full right halo is buffered before it steps with `eof: false`; violating
+        // that is a loud dev-time failure rather than a quiet accuracy regression. (At true EOF,
+        // shrinking is correct and expected — pass `eof: true`.)
+        precondition(eof || futureMel >= haloRightMel || newMelFrames == 0,
+                     "BoundedWindowPlanner.plan(eof: false) needs at least haloRightMel (\(haloRightMel)) "
+                     + "future mel frames for the right halo, but only \(max(0, futureMel)) are available "
+                     + "(g0=\(g0), newMelFrames=\(newMelFrames), totalMel=\(totalMel)). "
+                     + "Buffer more samples before stepping, or pass eof: true for the final step.")
+
         let rightHalo = min(haloRightMel, max(0, futureMel))
 
         let melWindowStart = g0 - leftHalo

@@ -1134,7 +1134,6 @@ struct BoundedWindowPlannerTests {
         BoundedWindowPlanner(
             hop: 160,
             nFft: 512,
-            winLength: 400,
             subsamplingFactor: 8,
             chunkLenEmb: 188,
             haloLeftMel: 16,
@@ -1244,6 +1243,8 @@ struct BoundedWindowPlannerTests {
 
     /// EOF-adjacent step where some future frames remain but fewer than H_R: rc must be
     /// `min(1, availableFutureEmb)` and stay 1 when at least one future emb frame exists.
+    /// Here only 4 future mel frames exist (< H_R = 16), so the right halo is legitimately
+    /// shrunk — which is only allowed at true EOF (`eof: true`); see `rightHaloNotShrunkMidStream`.
     @Test func eofStepPartialFuture() {
         let p = makePlanner()
         // total = C + 4 mel frames: step 1 has a full chunk but only 4 future mel frames (< H_R=16).
@@ -1252,10 +1253,34 @@ struct BoundedWindowPlannerTests {
         let totalMel = melFramesForSamples(totalSamples)
         #expect(totalMel == stepMelFrames + futureMel)
 
-        let spec = p.plan(g0: 0, totalKnownSamples: totalSamples, eof: false)
+        let spec = p.plan(g0: 0, totalKnownSamples: totalSamples, eof: true)
         #expect(spec.newMelFrames == stepMelFrames, "step 1 still consumes a full C")
         #expect(spec.rcEmbCount == 1, "4 future mel frames yield 1 emb frame => rc = min(1, 1) = 1")
         #expect(spec.rawEnd <= totalSamples)
+    }
+
+    /// Mid-stream contract (Task-3 review follow-up A): with `eof: false` the caller asserts more
+    /// audio is coming, so the right halo must NOT be shrunk for lack of buffered frames. The planner
+    /// `precondition`s on `futureMel >= haloRightMel`; under-filling it traps loudly instead of
+    /// silently degrading the right-context embeddings.
+    ///
+    /// Swift Testing has no clean in-process "expect this precondition to fire" matcher (a trap aborts
+    /// the test runner), so we assert the BOUNDARY that *just barely satisfies* the contract does NOT
+    /// trap, and document the trap. `futureMel == haloRightMel` is the smallest legal value.
+    @Test func rightHaloNotShrunkMidStream() {
+        let p = makePlanner()
+        // Buffer exactly C (new) + H_R (right halo) mel frames beyond g0=0 — the minimum a mid-stream
+        // step needs. futureMel = totalMel - C = H_R, which satisfies the precondition exactly.
+        let totalMel = stepMelFrames + p.haloRightMel
+        let totalSamples = (totalMel - 1) * p.hop // melFramesForSamples => totalMel
+        #expect(melFramesForSamples(totalSamples) == totalMel)
+
+        // Does not trap: the right halo is full, so the lookahead matches the full-file forward.
+        let spec = p.plan(g0: 0, totalKnownSamples: totalSamples, eof: false)
+        #expect(spec.newMelFrames == stepMelFrames)
+        #expect(spec.rcEmbCount == 1, "a full right halo yields the requested 1 rc emb frame")
+        // NOTE: calling p.plan(g0: 0, totalKnownSamples: (stepMelFrames + 4 - 1)*hop, eof: false) here
+        // — only 4 future mel frames < H_R — WOULD trap by precondition. Not exercised (trap aborts).
     }
 }
 

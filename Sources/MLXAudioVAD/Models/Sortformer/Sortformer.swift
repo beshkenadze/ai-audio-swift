@@ -1005,6 +1005,224 @@ public class SortformerModel: Module {
         }
     }
 
+    /// Memory-bounded long-form streaming diarization.
+    ///
+    /// Unlike `generateStream(audio:)` — which materialises whole-file mel features and (for the
+    /// AOSC/v2.1 path) a full-file `preEncode`, so its peak memory scales with total duration —
+    /// this path consumes raw 16 kHz mono PCM incrementally through a pull closure. It processes
+    /// the stream in fixed steps of `C = chunkLenEmb * subsamplingFactor` NEW mel frames over a
+    /// phase-aligned sliding window with left/right halos (see `BoundedWindowPlanner`), so every
+    /// per-step tensor is sized to ~one step + halo regardless of total duration. Combined with the
+    /// D1 FIFO cap (`maybeCompressState`), peak memory and per-chunk latency stay flat for
+    /// multi-hour recordings.
+    ///
+    /// - Parameters:
+    ///   - audioSource: Async pull closure returning the next block of 16 kHz mono PCM `[Float]`;
+    ///     returns `nil` at EOF. Blocks may be any length (re-buffered internally). The `MLXArray`
+    ///     is built inside this method, never passed through the closure (Sendable-clean).
+    ///   - chunkDuration: Target step size in seconds (rounded to the embedding grid; default 15 s
+    ///     = `chunkLen` = 188 emb frames). Any value is safe under the D1 cap.
+    public func generateStreamBounded(
+        audioSource: @escaping () async throws -> [Float]?,
+        sampleRate: Int = 16000,
+        chunkDuration: Float = 15.0,
+        threshold: Float = 0.5,
+        minDuration: Float = 0.0,
+        mergeGap: Float = 0.0,
+        spkcacheMax: Int = 188,
+        fifoMax: Int = 188,
+        verbose: Bool = false
+    ) -> AsyncThrowingStream<DiarizationOutput, Error> {
+        let sendableModel = UncheckedSendableBox(self)
+        let sendableSource = UncheckedSendableBox(audioSource)
+        return AsyncThrowingStream { continuation in
+            let task = Task.detached {
+                let model = sendableModel.value
+                let audioSource = sendableSource.value
+                let proc = model.config.processorConfig
+                let mc = model.config.modulesConfig
+                let subsamplingFactor = model.config.fcEncoderConfig.subsamplingFactor
+                let hop = proc.hopLength
+                let nFft = proc.nFft
+                let frameDuration = Float(hop * subsamplingFactor) / Float(sampleRate)
+
+                // Step size on the embedding grid: round chunkDuration to a whole number of emb
+                // frames, clamp to >= 1, then C = chunkLenEmb * subsamplingFactor NEW mel frames.
+                var chunkLenEmb = Int(round(
+                    chunkDuration * Float(sampleRate) / Float(hop) / Float(subsamplingFactor)
+                ))
+                chunkLenEmb = max(chunkLenEmb, 1)
+
+                let planner = BoundedWindowPlanner(
+                    hop: hop,
+                    nFft: nFft,
+                    subsamplingFactor: subsamplingFactor,
+                    chunkLenEmb: chunkLenEmb,
+                    haloLeftMel: 16,
+                    haloRightMel: 16,
+                    chunkRightContext: mc.useAosc ? mc.chunkRightContext : 0
+                )
+                let stepMel = planner.stepMelFrames
+                let haloLeftMel = planner.haloLeftMel
+                let haloRightMel = planner.haloRightMel
+
+                // Pull-before-slice gate: a full (non-shrunk) interior window for first-new-frame
+                // `g0` spans mel frames [g0 - H_L, g0 + C + H_R); its raw end (matching the planner)
+                // is (g0 + C + H_R) * hop + nFft/2. We must have buffered at least that many samples
+                // before stepping with eof:false, satisfying BOTH the accumulator's slice precondition
+                // AND the planner's "don't shrink the right halo mid-stream" precondition.
+                func rawEndNeededForFullWindow(_ g0: Int) -> Int {
+                    (g0 + stepMel + haloRightMel) * hop + nFft / 2
+                }
+
+                do {
+                    var acc = PCMAccumulator()
+                    var state = model.initStreamingState()
+                    var g0 = 0                  // global mel index of the first NEW frame this step
+                    var globalDiarFrame = 0     // emitted emb frames so far (time offset accumulator)
+                    var eof = false
+                    var chunkIdx = 0
+
+                    while true {
+                        try Task.checkCancellation()
+
+                        // 1. Pull-before-slice: buffer until a full window is available, or EOF.
+                        while !eof && acc.totalAppendedCount < rawEndNeededForFullWindow(g0) {
+                            if let block = try await audioSource() {
+                                acc.append(block)
+                            } else {
+                                eof = true
+                            }
+                        }
+
+                        // 2. Plan this step against what is now known.
+                        let spec = planner.plan(
+                            g0: g0,
+                            totalKnownSamples: acc.totalAppendedCount,
+                            eof: eof
+                        )
+                        if spec.newMelFrames == 0 { break } // nothing left at EOF
+
+                        // 3. Slice the exact raw window (built into an MLXArray inside this task).
+                        let windowSamples = acc.slice(from: spec.rawStart, to: spec.rawEnd)
+
+                        // 4. Mel for the window (AOSC/v2.1 path: no normalize, no extra pad), then
+                        //    slice to exactly the aligned interior `melWindowFrameCount` frames.
+                        var mel = extractMelFeatures(
+                            MLXArray(windowSamples),
+                            sampleRate: sampleRate,
+                            nFft: nFft,
+                            hopLength: hop,
+                            winLength: proc.winLength,
+                            nMels: proc.featureSize,
+                            preemphasisCoeff: proc.preemphasis,
+                            normalize: nil,
+                            padTo: 0
+                        )
+                        // mel is (1, nMels, frames); the first `melWindowFrameCount` frames are the
+                        // hop-aligned interior corresponding to global frames [melWindowStart, ...).
+                        let melFrames = mel.dim(2)
+                        let keep = min(spec.melWindowFrameCount, melFrames)
+                        mel = mel[0..., 0..., ..<keep]
+
+                        // 5. preEncode the window once -> embeddings.
+                        let (emb, _) = model.fcEncoder.preEncode(
+                            mel, length: MLXArray([Int32(keep)])
+                        )
+                        let producedEmb = emb.dim(1)
+                        let chunkEnd = spec.discardLeftEmb + spec.chunkEmbCount
+                        let rcEnd = chunkEnd + spec.rcEmbCount
+                        assert(
+                            producedEmb >= rcEnd,
+                            "preEncode produced \(producedEmb) emb frames but planner expected at least "
+                            + "\(rcEnd) (discardLeft=\(spec.discardLeftEmb) + chunk=\(spec.chunkEmbCount) "
+                            + "+ rc=\(spec.rcEmbCount)); window=\(keep) mel frames"
+                        )
+
+                        // Chunk frames ONLY (no left halo, no right context).
+                        let chunkEmbs = emb[0..., spec.discardLeftEmb..<chunkEnd, 0...]
+                        var rcEmbs: MLXArray? = nil
+                        if spec.rcEmbCount > 0 {
+                            rcEmbs = emb[0..., chunkEnd..<rcEnd, 0...]
+                        }
+
+                        // 6. Streaming encoder/transformer pass over chunk frames + right context.
+                        let (chunkPreds, newState) = model.streamingStepFromEmbeddings(
+                            chunkEmbs: chunkEmbs,
+                            chunkDiarLen: spec.chunkEmbCount,
+                            state: state,
+                            rightContextEmbs: rcEmbs
+                        )
+                        state = newState
+
+                        // 7. Segments, offset by the global diar-frame counter.
+                        let chunkTimeOffset = Float(globalDiarFrame) * frameDuration
+                        var segments = Self.predsToSegments(
+                            chunkPreds,
+                            frameDuration: frameDuration,
+                            threshold: threshold,
+                            minDuration: minDuration,
+                            mergeGap: mergeGap
+                        )
+                        segments = segments.map {
+                            DiarizationSegment(
+                                start: $0.start + chunkTimeOffset,
+                                end: $0.end + chunkTimeOffset,
+                                speaker: $0.speaker
+                            )
+                        }
+                        globalDiarFrame += spec.chunkEmbCount
+
+                        if verbose {
+                            chunkIdx += 1
+                            let t0 = chunkTimeOffset
+                            let t1 = t0 + Float(chunkPreds.dim(0)) * frameDuration
+                            print("  Chunk \(chunkIdx): \(String(format: "%.2f", t0))s-\(String(format: "%.2f", t1))s  \(segments.count) segments, context=\(state.spkcacheLen)+\(state.fifoLen) frames, retained=\(acc.retainedCount) samples")
+                        }
+
+                        let activeSpeakers = Set(segments.map { $0.speaker })
+                        continuation.yield(DiarizationOutput(
+                            segments: segments,
+                            speakerProbs: chunkPreds,
+                            numSpeakers: activeSpeakers.count
+                        ))
+
+                        // 8. Cap state (D1 true cap). Force-evaluate per-step tensors + state arrays
+                        //    so the lazy graph cannot grow across steps (flat memory).
+                        state = Self.maybeCompressState(
+                            state,
+                            spkcacheMax: spkcacheMax,
+                            fifoMax: fifoMax,
+                            modulesCfg: mc
+                        )
+                        MLX.eval(
+                            chunkPreds,
+                            state.spkcache, state.spkcachePreds,
+                            state.fifo, state.fifoPreds,
+                            state.meanSilEmb, state.nSilFrames
+                        )
+
+                        // 9. Advance and drop consumed PCM, keeping only the next step's left halo
+                        //    (+ STFT margin) — never below the next window's rawStart.
+                        g0 += spec.newMelFrames
+                        acc.drop(beforeAbsolute: max(0, (g0 - haloLeftMel) * hop))
+
+                        if eof && spec.newMelFrames < stepMel { break } // final partial chunk done
+                    }
+
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+
+            // Stop the producer when the consumer terminates (break, cancel, dealloc).
+            continuation.onTermination = { _ in
+                task.cancel()
+            }
+        }
+    }
+
     // MARK: - State Management
 
     private static func updateStreamingState(
