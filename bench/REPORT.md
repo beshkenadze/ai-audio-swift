@@ -51,12 +51,18 @@ Per-chunk progress was identical between the two paths on every one of the 10 ch
 counts, same `context=spkcache+fifo` lengths, e.g. chunk 1 `0+188`, chunks 2–9 `188+376`, chunk 10
 `188+372`).
 
-**Verdict: bounded ≈ precompute — PASS.** Overall frame agreement is **100.00 %** (≫ the ≥90 %
-expectation, far above the 80 % bug threshold). The bounded sliding-window/halo path is bit-faithful
-to the full-file precompute path on this clip — no frame-accounting or dtype drift.
+**Verdict: bounded ≈ precompute — PASS.** Overall frame agreement is **100.00 %** (1875/1875 cells,
+24 segments each path). The `--self-check` gate requires **exact** frame agreement *and* equal segment
+count to pass — not a tolerance band. Rationale: the bounded sliding-window/halo path is *designed* to
+reproduce the full-file mel/preEncode bit-for-bit (hop-aligned windowing), so any drift, even a few
+frames, is a regression rather than acceptable noise. (An earlier ≥90 %/<80 % threshold was too lenient
+— a 5-frame-per-segment drift would still clear ~99 % — so it was tightened to bit-exactness.) On this
+clip the bounded path is bit-faithful, with no frame-accounting or dtype divergence.
 
-> Note: only 1 speaker slot was active in the first 150 s of this recording (see Gate 2 below); the
-> gate measures consistency between paths, which is exact regardless of how many slots are active.
+> **Coverage limitation:** only 1 speaker slot was active in the first 150 s of this recording (see
+> Gate 2), so this run does not exercise multi-speaker slot *alignment* between the two paths. The
+> agreement is exact over the frames present (641 active + 1234 silent of 1875); a 2+-speaker clip
+> would broaden the guard's coverage of slot assignment.
 
 ---
 
@@ -102,12 +108,13 @@ MLX peak memory:       0.941 GB
 | Distinct speakers | 1 (`speaker_0`) |
 | State size (spkcache+fifo) | constant: max spkcache 188, max fifo 376; chunk 269 = `188+376`, identical to chunk 2 |
 
-### Per-chunk latency is FLAT
+### Per-chunk latency is bounded and non-growing
 
 first **0.110 s** / median **0.127 s** / last **0.241 s** / max **0.241 s**.
 
-The printed "2.19× (last/first)" ratio is a small-number artifact (0.11 s → 0.24 s), not the original
-bug. Two independent confirmations:
+The printed "2.19× (last/first)" ratio compares two single samples (0.11 s → 0.24 s) and is jitter,
+**not** evidence of flatness on its own. The real evidence that latency does not grow with duration is
+structural, from two independent confirmations:
 
 1. The **max** latency (0.241 s) is not at the end — a separate 40-chunk / 10-min run hit the same
    ~0.24–0.28 s max early, so it is timing jitter, not end-of-run growth.
@@ -143,8 +150,8 @@ bounded path runs the entire file at <1 GB MLX.
 ## Verdict
 
 **Both gates pass.** Memory is **bounded** (MLX peak 0.941 GB, RSS 0.324 GB — flat across the 67.6-min
-file, far under the 18 GB cap, not duration-scaling). Per-chunk latency is **flat** (median 0.127 s,
-max 0.241 s, no growth toward the end; streaming state held constant at `188+376`). The bounded path
+file, far under the 18 GB cap, not duration-scaling). Per-chunk latency is **bounded and non-growing**
+(median 0.127 s, max 0.241 s, no growth toward the end; streaming state held constant at `188+376`). The bounded path
 is **bit-faithful to the precompute path** (100.00 % frame agreement on the 150 s self-check). The
 core goal of the task — multi-hour diarization at flat memory and flat per-chunk latency — is
 achieved: the full 67.6-min file completes in 35 s wall (RTF 0.009) where the original unbounded

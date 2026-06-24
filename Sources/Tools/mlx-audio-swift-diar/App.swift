@@ -544,18 +544,27 @@ enum App {
         print(String(format: "Total speech-time:        precompute %.2f s  /  bounded %.2f s", preTotalSec, bndTotalSec))
         print("====================================================================")
 
-        // Verdict thresholds (per Task 7): >=~90% expected; <80% signals a frame-accounting bug.
-        if overallPct < 80.0 {
-            print("")
-            print("FAIL: overall frame agreement \(String(format: "%.2f", overallPct))% < 80% — likely a frame-accounting/dtype bug.")
-            print("      Do NOT commit. Inspect window planning (BoundedWindowPlanner), dtype, and MLX.eval discipline.")
+        // Verdict (per Task 7): the bounded path is DESIGNED to be bit-faithful to the precompute
+        // path — hop-aligned windowing reproduces the full-file mel/preEncode exactly. So the guard
+        // requires EXACT frame agreement AND equal segment count, not a tolerance band: a few-frame
+        // drift would still clear ~99% yet is a genuine frame-accounting regression. We also fail a
+        // both-empty result, since a silent self-check proves nothing on a speech clip.
+        let exactFrames = (totalAgree == totalCells)
+        let segMatch = precomputeSegments.count == boundedSegments.count
+        let bothEmpty = precomputeSegments.isEmpty && boundedSegments.isEmpty
+        print("")
+        if bothEmpty {
+            print("FAIL: both paths produced ZERO segments on a clip expected to contain speech;")
+            print("      a silent self-check proves nothing. Check the input clip and model load.")
             exit(2)
-        } else if overallPct < 90.0 {
-            print("")
-            print("WARN: overall frame agreement \(String(format: "%.2f", overallPct))% in [80,90) — passable but lower than expected (~>=90%).")
+        } else if exactFrames && segMatch {
+            print("PASS: bounded is bit-faithful to precompute (100.00% frame agreement; \(precomputeSegments.count) segments each).")
         } else {
-            print("")
-            print("PASS: bounded ≈ precompute (overall frame agreement \(String(format: "%.2f", overallPct))% >= 90%).")
+            print("FAIL: bounded diverged from precompute — agreement \(String(format: "%.2f", overallPct))% "
+                + "(\(totalAgree)/\(totalCells) frames); segments precompute=\(precomputeSegments.count) vs bounded=\(boundedSegments.count).")
+            print("      The bounded path must reproduce the precompute frames EXACTLY; any drift is a")
+            print("      regression — inspect BoundedWindowPlanner, dtype casts, and MLX.eval discipline.")
+            exit(2)
         }
     }
 
