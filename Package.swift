@@ -61,10 +61,6 @@ let package = Package(
             name: "nemo-mic",
             targets: ["nemo-mic"],
         ),
-        .executable(
-            name: "mic-compare",
-            targets: ["mic-compare"],
-        ),
 
     ],
     dependencies: [
@@ -72,7 +68,6 @@ let package = Package(
         .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", .upToNextMajor(from: "3.31.3")),
         .package(url: "https://github.com/huggingface/swift-transformers.git", .upToNextMajor(from: "1.1.6")),
         .package(url: "https://github.com/huggingface/swift-huggingface.git", .upToNextMajor(from: "0.8.1")),
-        .package(path: "../../AudioEnhanceKit")
     ],
     targets: [
         // MARK: - MLXAudioCore
@@ -285,13 +280,6 @@ let package = Package(
             name: "nemo-mic",
             dependencies: ["MLXAudioCore", "MLXAudioSTT"],
             path: "Sources/Tools/nemo-mic"
-        ),
-        .executableTarget(
-            name: "mic-compare",
-            dependencies: ["MLXAudioCore", "MLXAudioSTT", "MLXAudioVAD", "MLXAudioSTS",
-                           .product(name: "AudioEnhanceKitDFN", package: "AudioEnhanceKit"),
-                           .product(name: "AudioEnhanceKitDPDFNet", package: "AudioEnhanceKit")],
-            path: "Sources/Tools/mic-compare"
         ),
 
         // MARK: - Tests
