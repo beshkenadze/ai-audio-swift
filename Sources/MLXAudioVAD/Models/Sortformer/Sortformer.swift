@@ -1015,16 +1015,30 @@ public class SortformerModel: Module {
         )
     }
 
-    private static func maybeCompressState(
+    static func maybeCompressState(
         _ state: StreamingState,
         spkcacheMax: Int,
         fifoMax: Int,
         modulesCfg: ModulesConfig
     ) -> StreamingState {
-        if state.fifoLen <= fifoMax {
-            return state
+        // Loop the pop/compress until the FIFO is within bound. A single chunk may emit
+        // more than `spkcacheUpdatePeriod` embedding frames; `compressOnce` pops at most one
+        // period (preserving AOSC per-period semantics), so capping requires repeated passes.
+        var s = state
+        while s.fifoLen > fifoMax {
+            let before = s.fifoLen
+            s = compressOnce(s, spkcacheMax: spkcacheMax, fifoMax: fifoMax, modulesCfg: modulesCfg)
+            if s.fifoLen >= before { break }  // safety: no progress
         }
+        return s
+    }
 
+    private static func compressOnce(
+        _ state: StreamingState,
+        spkcacheMax: Int,
+        fifoMax: Int,
+        modulesCfg: ModulesConfig
+    ) -> StreamingState {
         let useAosc = modulesCfg.useAosc
 
         var popLen = state.fifoLen - fifoMax

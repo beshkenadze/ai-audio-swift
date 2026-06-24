@@ -1067,3 +1067,58 @@ struct SileroVADNetworkTests {
         }
     }
 }
+
+// MARK: - FIFO Cap (D1) Tests
+
+struct SortformerFifoCapTests {
+
+    /// AOSC v2.1 / 4-spk modules config, decoded from a JSON literal (no memberwise init exists).
+    private func loadSortformerModulesConfigAOSC() throws -> ModulesConfig {
+        let json = """
+        {
+          "num_speakers": 4,
+          "fc_d_model": 512,
+          "tf_d_model": 192,
+          "subsampling_factor": 8,
+          "chunk_len": 188,
+          "fifo_len": 188,
+          "spkcache_len": 188,
+          "spkcache_update_period": 188,
+          "chunk_left_context": 1,
+          "chunk_right_context": 1,
+          "use_aosc": true
+        }
+        """
+        let data = json.data(using: .utf8)!
+        return try JSONDecoder().decode(ModulesConfig.self, from: data)
+    }
+
+    /// Build a StreamingState whose FIFO holds `fifoFrames` frames (spkcache empty).
+    /// Uses small varied (non-zero) preds so the AOSC compression path is not degenerate.
+    private func makeState(fifoFrames: Int, embDim: Int, nSpk: Int) -> StreamingState {
+        let fifo = MLXRandom.uniform(low: -1.0, high: 1.0, [1, fifoFrames, embDim])
+        let fifoPreds = MLXRandom.uniform(low: 0.0, high: 1.0, [1, fifoFrames, nSpk])
+        return StreamingState(
+            spkcache: MLXArray.zeros([1, 0, embDim]),
+            spkcachePreds: MLXArray.zeros([1, 0, nSpk]),
+            fifo: fifo,
+            fifoPreds: fifoPreds,
+            framesProcessed: 0,
+            meanSilEmb: MLXArray.zeros([1, embDim]),
+            nSilFrames: MLXArray.zeros([1])
+        )
+    }
+
+    @Test func testFifoCappedAfterOversizedChunk() throws {
+        let cfg = try loadSortformerModulesConfigAOSC()
+        let embDim = cfg.fcDModel
+        let nSpk = cfg.numSpeakers
+        // FIFO overflow (700) >> spkcacheUpdatePeriod (188): the old code left it > fifoMax.
+        let state = makeState(fifoFrames: 700, embDim: embDim, nSpk: nSpk)
+        let out = SortformerModel.maybeCompressState(
+            state, spkcacheMax: 188, fifoMax: 188, modulesCfg: cfg
+        )
+        #expect(out.fifoLen <= 188, "FIFO must be capped regardless of overflow size")
+        #expect(out.spkcacheLen <= 188, "spkcache must stay capped")
+    }
+}
