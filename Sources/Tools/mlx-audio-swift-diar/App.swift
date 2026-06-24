@@ -54,6 +54,7 @@ struct CLI {
     let threshold: Float
     let rttmOut: String?
     let maxSeconds: Double?
+    let selfCheck: Bool
     let verbose: Bool
 
     static func parse() throws -> CLI {
@@ -67,6 +68,7 @@ struct CLI {
         var threshold: Float = 0.5
         var rttmOut: String?
         var maxSeconds: Double?
+        var selfCheck = false
         var verbose = false
 
         var iterator = arguments.makeIterator()
@@ -93,6 +95,8 @@ struct CLI {
                 guard let value = iterator.next() else { throw CLIError.missingValue(arg) }
                 guard let parsed = Double(value), parsed > 0 else { throw CLIError.invalidValue(arg, value) }
                 maxSeconds = parsed
+            case "--self-check":
+                selfCheck = true
             case "--verbose", "-v":
                 verbose = true
             case "--help", "-h":
@@ -118,6 +122,7 @@ struct CLI {
             threshold: threshold,
             rttmOut: rttmOut,
             maxSeconds: maxSeconds,
+            selfCheck: selfCheck,
             verbose: verbose
         )
     }
@@ -143,12 +148,18 @@ struct CLI {
               --threshold <f>            Speaker activity threshold in [0,1]. Default: 0.5
               --rttm-out <path>          Optional path to write RTTM segments
               --max-seconds <n>          Optional: stop feeding after N seconds of audio (smoke runs)
+              --self-check               Regression guard: load a SHORT clip fully and compare the
+                                         precompute path (generateStream) against the bounded path
+                                         (generateStreamBounded) on identical samples; print per-slot
+                                         and overall frame-agreement. Use with --max-seconds to bound
+                                         the clip (e.g. --max-seconds 150 --chunk-duration 15).
               --verbose, -v              Print per-chunk progress
               --help, -h                 Show this help
 
             Examples:
               \(executable) --input recording.flac --rttm-out out.rttm
               \(executable) --input recording.flac --max-seconds 60 --chunk-duration 15 --verbose
+              \(executable) --self-check --input clip.flac --max-seconds 150 --chunk-duration 15 -v
             """
         )
     }
@@ -342,6 +353,11 @@ enum App {
 
         try ensureMLXRuntimeReadyForShell()
 
+        if args.selfCheck {
+            try await runSelfCheck(args, inputURL: inputURL)
+            return
+        }
+
         // Audio duration (for RTF) from the source file, capped by --max-seconds if set.
         let probe = try AVAudioFile(forReading: inputURL)
         let fileDurationSec = Double(probe.length) / probe.processingFormat.sampleRate
@@ -416,6 +432,152 @@ enum App {
             peakRSS: peakRSS,
             mlxPeak: mlxPeak
         )
+    }
+
+    // MARK: - Self-consistency gate (precompute vs bounded)
+
+    /// Frame grid resolution for the agreement matrix: hop * subsamplingFactor / sr = 160*8/16000.
+    static let selfCheckFrameDuration = 0.08
+
+    /// Loads a SHORT clip fully (16 kHz mono) and compares the precompute streaming path
+    /// (`generateStream`, full-file mel + preEncode) against the memory-bounded path
+    /// (`generateStreamBounded`, sliding window) on the SAME samples. Renders both segment lists
+    /// to per-frame per-speaker-slot activity matrices and reports agreement. Speaker slots are
+    /// directly comparable (the model assigns slots deterministically — no Hungarian matching).
+    static func runSelfCheck(_ args: CLI, inputURL: URL) async throws {
+        print("Loading Sortformer model (\(args.repo))")
+        let model = try await SortformerModel.fromPretrained(args.repo)
+
+        // Load the SHORT clip FULLY as one mono [Float] @ 16 kHz, then slice to --max-seconds.
+        let (sr, audioArray) = try loadAudioArray(from: inputURL, sampleRate: 16000)
+        var samples = audioArray.asArray(Float.self)
+        if let maxSeconds = args.maxSeconds {
+            let budget = Int(maxSeconds * Double(sr))
+            if samples.count > budget { samples = Array(samples.prefix(budget)) }
+        }
+        let clipDurationSec = Double(samples.count) / Double(sr)
+        print(String(format: "Self-check clip: %.2f s @ %d Hz (%d samples)", clipDurationSec, sr, samples.count))
+        print(String(format: "Running BOTH paths with chunk-duration=%.1fs, threshold=%.2f", args.chunkDuration, args.threshold))
+
+        // --- Precompute path: generateStream over the full MLXArray of the SAME samples. ---
+        print("  [1/2] precompute path (generateStream)...")
+        var precomputeSegments: [DiarizationSegment] = []
+        let preStart = Date()
+        for try await out in model.generateStream(
+            audio: MLXArray(samples),
+            sampleRate: 16000,
+            chunkDuration: args.chunkDuration,
+            threshold: args.threshold,
+            verbose: args.verbose
+        ) {
+            precomputeSegments.append(contentsOf: out.segments)
+        }
+        let preWall = Date().timeIntervalSince(preStart)
+
+        // --- Bounded path: generateStreamBounded over a closure yielding the SAME samples
+        //     in ~1 s blocks, then nil. ---
+        print("  [2/2] bounded path (generateStreamBounded)...")
+        let blockSize = 16000 // ~1 s blocks
+        let cursor = Counter()
+        let sendableSamples = samples
+        let audioSource: () async throws -> [Float]? = {
+            let start = cursor.value
+            if start >= sendableSamples.count { return nil }
+            let end = min(start + blockSize, sendableSamples.count)
+            cursor.add(end - start)
+            return Array(sendableSamples[start..<end])
+        }
+        var boundedSegments: [DiarizationSegment] = []
+        let bndStart = Date()
+        for try await out in model.generateStreamBounded(
+            audioSource: audioSource,
+            sampleRate: 16000,
+            chunkDuration: args.chunkDuration,
+            threshold: args.threshold,
+            verbose: args.verbose
+        ) {
+            boundedSegments.append(contentsOf: out.segments)
+        }
+        let bndWall = Date().timeIntervalSince(bndStart)
+
+        // --- Render to per-frame per-slot activity matrices over [0, clipDuration]. ---
+        let frameDur = selfCheckFrameDuration
+        let nFrames = max(1, Int((clipDurationSec / frameDur).rounded(.up)))
+        let nSlots = (precomputeSegments + boundedSegments).map { $0.speaker }.max().map { $0 + 1 } ?? 0
+
+        let preMatrix = activityMatrix(precomputeSegments, nFrames: nFrames, nSlots: nSlots, frameDur: frameDur)
+        let bndMatrix = activityMatrix(boundedSegments, nFrames: nFrames, nSlots: nSlots, frameDur: frameDur)
+
+        // Per-slot frame agreement + per-slot speech time; overall frame agreement.
+        var totalAgree = 0
+        let totalCells = nFrames * max(nSlots, 1)
+        print("")
+        print("============= Self-Consistency (precompute vs bounded) =============")
+        print(String(format: "Clip duration:         %.2f s  (%d frames @ %.2fs)", clipDurationSec, nFrames, frameDur))
+        print("Speaker slots:         \(nSlots)")
+        print(String(format: "Precompute wall:       %.2f s   segments: %d", preWall, precomputeSegments.count))
+        print(String(format: "Bounded wall:          %.2f s   segments: %d", bndWall, boundedSegments.count))
+        print("--------------------------------------------------------------------")
+        print("Per-slot frame agreement %  |  speech-time precompute / bounded (s)")
+        for slot in 0..<max(nSlots, 1) {
+            var agree = 0
+            var prePos = 0
+            var bndPos = 0
+            for f in 0..<nFrames {
+                let p = nSlots > 0 ? preMatrix[slot * nFrames + f] : false
+                let b = nSlots > 0 ? bndMatrix[slot * nFrames + f] : false
+                if p == b { agree += 1 }
+                if p { prePos += 1 }
+                if b { bndPos += 1 }
+            }
+            totalAgree += agree
+            let pct = nFrames > 0 ? 100.0 * Double(agree) / Double(nFrames) : 100.0
+            let preSec = Double(prePos) * frameDur
+            let bndSec = Double(bndPos) * frameDur
+            print(String(format: "  slot %d:  %6.2f %%        |  %7.2f / %7.2f", slot, pct, preSec, bndSec))
+        }
+        let overallPct = totalCells > 0 ? 100.0 * Double(totalAgree) / Double(totalCells) : 100.0
+        print("--------------------------------------------------------------------")
+        print(String(format: "OVERALL frame agreement:  %.2f %%  (%d / %d cells)", overallPct, totalAgree, totalCells))
+        let preTotalSec = Double(preMatrix.lazy.filter { $0 }.count) * frameDur
+        let bndTotalSec = Double(bndMatrix.lazy.filter { $0 }.count) * frameDur
+        print(String(format: "Total speech-time:        precompute %.2f s  /  bounded %.2f s", preTotalSec, bndTotalSec))
+        print("====================================================================")
+
+        // Verdict thresholds (per Task 7): >=~90% expected; <80% signals a frame-accounting bug.
+        if overallPct < 80.0 {
+            print("")
+            print("FAIL: overall frame agreement \(String(format: "%.2f", overallPct))% < 80% — likely a frame-accounting/dtype bug.")
+            print("      Do NOT commit. Inspect window planning (BoundedWindowPlanner), dtype, and MLX.eval discipline.")
+            exit(2)
+        } else if overallPct < 90.0 {
+            print("")
+            print("WARN: overall frame agreement \(String(format: "%.2f", overallPct))% in [80,90) — passable but lower than expected (~>=90%).")
+        } else {
+            print("")
+            print("PASS: bounded ≈ precompute (overall frame agreement \(String(format: "%.2f", overallPct))% >= 90%).")
+        }
+    }
+
+    /// Flatten segments into a row-major [slot * nFrames + frame] boolean activity grid over
+    /// `[0, nFrames * frameDur)`. Each segment marks frames whose centre falls in [start, end).
+    static func activityMatrix(
+        _ segments: [DiarizationSegment],
+        nFrames: Int,
+        nSlots: Int,
+        frameDur: Double
+    ) -> [Bool] {
+        guard nSlots > 0, nFrames > 0 else { return [] }
+        var grid = [Bool](repeating: false, count: nSlots * nFrames)
+        for seg in segments {
+            let slot = seg.speaker
+            guard slot >= 0, slot < nSlots else { continue }
+            let f0 = max(0, Int((Double(seg.start) / frameDur).rounded(.down)))
+            let f1 = min(nFrames, Int((Double(seg.end) / frameDur).rounded(.up)))
+            if f1 <= f0 { continue }
+            for f in f0..<f1 { grid[slot * nFrames + f] = true }
+        }
+        return grid
     }
 
     static func printMetrics(
