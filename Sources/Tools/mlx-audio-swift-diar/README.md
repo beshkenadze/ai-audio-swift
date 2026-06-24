@@ -3,11 +3,18 @@
 Memory-bounded long-form streaming speaker diarization benchmark host for the Sortformer
 model (`SortformerModel.generateStreamBounded`).
 
-Unlike `generate` (offline, OOMs on long audio) and `generateStream` (precompute streaming, not
-memory-bounded), this tool decodes and resamples the input **incrementally** — one window at a
-time via `AVAudioFile` + a persistent `AVAudioConverter` (downmix + resample to 16 kHz mono
-Float32) — and feeds raw PCM blocks into the bounded streaming path through a pull closure. Peak
-memory and per-chunk latency stay flat regardless of file duration.
+`SortformerModel` exposes three inference paths (see the methods in
+`Sources/MLXAudioVAD/Models/Sortformer/Sortformer.swift` and the
+[design doc](../../../docs/plans/2026-06-24-sortformer-bounded-streaming-design.md)):
+
+- `generate(audio:)` — offline single forward pass; lowest latency for short clips; OOMs on long audio.
+- `generateStream(audio:)` — precompute streaming; takes the whole `MLXArray`, not memory-bounded.
+- `generateStreamBounded(audioSource:)` — the memory-bounded long-form path this tool drives.
+
+This tool decodes and resamples the input **incrementally** — one window at a time via
+`AVAudioFile` + a persistent `AVAudioConverter` (downmix + resample to 16 kHz mono Float32) — and
+feeds raw PCM blocks into the bounded streaming path through a pull closure. Peak memory and
+per-chunk latency stay flat regardless of file duration.
 
 The process caps MLX/Metal memory at 18 GiB as its first action.
 
@@ -17,6 +24,9 @@ The process caps MLX/Metal memory at 18 GiB as its first action.
 swift build --product mlx-audio-swift-diar
 
 .build/debug/mlx-audio-swift-diar --input recording.flac --rttm-out out.rttm --verbose
+
+# Self-consistency regression guard (bounded vs precompute) on a short clip:
+.build/debug/mlx-audio-swift-diar --self-check --input clip.flac --max-seconds 150 --chunk-duration 15 -v
 ```
 
 > Run the `.build` binary directly — the SwiftPM CLI target ships the Metal `default.metallib`
@@ -32,6 +42,7 @@ swift build --product mlx-audio-swift-diar
 | `--threshold <f>` | `0.5` | Speaker-activity threshold in `[0, 1]` |
 | `--rttm-out <path>` | — | Optional RTTM output path |
 | `--max-seconds <n>` | — | Stop feeding after N seconds of audio (quick smokes) |
+| `--self-check` | off | Regression guard: load a short clip fully and compare bounded vs precompute (`generateStreamBounded` vs `generateStream`) for frame agreement. Pair with `--max-seconds`. |
 | `--verbose`, `-v` | off | Per-chunk progress |
 
 ## Metrics reported
@@ -41,3 +52,6 @@ swift build --product mlx-audio-swift-diar
 - Total segment count, distinct speaker count
 - Peak process RSS (`task_info` / `MACH_TASK_BASIC_INFO`)
 - MLX peak memory (`MLX.Memory.peakMemory`)
+
+Measured results (67.6-min file: flat memory, flat latency) are recorded in
+[`bench/REPORT.md`](../../../bench/REPORT.md).

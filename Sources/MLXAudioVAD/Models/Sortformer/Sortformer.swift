@@ -560,6 +560,16 @@ public class SortformerModel: Module {
 
     // MARK: - Offline Inference
 
+    /// Offline diarization: a single forward pass over the **whole** file.
+    ///
+    /// Computes mel features and runs the encoders over the entire waveform at once, then decodes
+    /// segments. Lowest latency for SHORT clips, but the whole-file encoder materialises
+    /// activations proportional to total duration, so it **OOMs on long audio** (Metal is hard-capped
+    /// on this machine; a multi-minute file can exceed the budget). Use it when you already hold the
+    /// full `MLXArray` and it comfortably fits — for short clips or one-shot offline jobs.
+    ///
+    /// For medium clips you already hold in memory, prefer `generateStream(audio:)`; for
+    /// long/streaming/unknown-length audio, use `generateStreamBounded(audioSource:)`.
     public func generate(
         audio: MLXArray,
         sampleRate: Int = 16000,
@@ -760,7 +770,9 @@ public class SortformerModel: Module {
         return (chunkPreds[0], newState)
     }
 
-    /// Feed a single audio chunk and get diarization results.
+    /// Single-chunk live streaming API: feed one audio chunk plus the carried `StreamingState` and
+    /// get this chunk's diarization output and the updated state. The caller owns chunking and state
+    /// threading; the D1 FIFO cap (`maybeCompressState`) bounds `spkcache`/`fifo` here too.
     public func feed(
         chunk: MLXArray,
         state: StreamingState,
@@ -848,7 +860,18 @@ public class SortformerModel: Module {
         }
     }
 
-    /// Process audio in chunks, yielding diarization results incrementally.
+    /// *Precompute* streaming diarization: yields per-chunk results incrementally but still takes the
+    /// full `MLXArray` up front.
+    ///
+    /// It computes whole-file mel features and (for the AOSC/v2.1 path) a whole-file `preEncode` to
+    /// supply right-context, then iterates chunk by chunk. It is therefore **NOT memory-bounded** —
+    /// peak memory and per-chunk latency grow with total duration; on long files it slows and OOMs
+    /// (per the bench, a ~50-min file stalled around 28 GB at ~63 %). Use it for short/medium clips,
+    /// or when you already hold the entire waveform and it fits.
+    ///
+    /// Benefits from the D1 FIFO cap (`maybeCompressState`) — which bounds `spkcache`/`fifo` for all
+    /// streaming paths — but the whole-file precompute remains the duration-scaling cost. For
+    /// long/streaming/unknown-length audio use `generateStreamBounded(audioSource:)` instead.
     public func generateStream(
         audio: MLXArray,
         sampleRate: Int = 16000,
@@ -1007,14 +1030,24 @@ public class SortformerModel: Module {
 
     /// Memory-bounded long-form streaming diarization.
     ///
+    /// The memory-bounded long-form path: diarizes streaming/unknown-length audio at flat memory
+    /// and flat per-chunk latency, regardless of total duration.
+    ///
     /// Unlike `generateStream(audio:)` — which materialises whole-file mel features and (for the
     /// AOSC/v2.1 path) a full-file `preEncode`, so its peak memory scales with total duration —
     /// this path consumes raw 16 kHz mono PCM incrementally through a pull closure. It processes
     /// the stream in fixed steps of `C = chunkLenEmb * subsamplingFactor` NEW mel frames over a
     /// phase-aligned sliding window with left/right halos (see `BoundedWindowPlanner`), so every
     /// per-step tensor is sized to ~one step + halo regardless of total duration. Combined with the
-    /// D1 FIFO cap (`maybeCompressState`), peak memory and per-chunk latency stay flat for
-    /// multi-hour recordings.
+    /// D1 FIFO cap (`maybeCompressState`, which bounds `spkcache`/`fifo` for all streaming paths),
+    /// peak memory and per-chunk latency stay flat for multi-hour recordings — the bench runs a
+    /// 67.6-min file at <1 GB MLX peak and ~0.13 s/chunk. Output is bit-faithful to
+    /// `generateStream` (same windowing, just incremental).
+    ///
+    /// The diarization core is format-agnostic: the caller supplies decoding, resampling, and
+    /// downmix to 16 kHz mono PCM via the closure (e.g. the `mlx-audio-swift-diar` tool feeds blocks
+    /// from a windowed `AVAudioFile` + `AVAudioConverter`). Use this for long/streaming/unknown-length
+    /// audio; for short/medium clips you already hold, `generateStream(audio:)` is simpler.
     ///
     /// - Parameters:
     ///   - audioSource: Async pull closure returning the next block of 16 kHz mono PCM `[Float]`;
