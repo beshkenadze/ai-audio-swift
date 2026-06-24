@@ -1122,3 +1122,139 @@ struct SortformerFifoCapTests {
         #expect(out.spkcacheLen <= 188, "spkcache must stay capped")
     }
 }
+
+// MARK: - Bounded Window Planner (frame accounting)
+
+/// Pure `Int` frame-accounting math for the bounded long-form streaming window.
+/// No MLX/Metal required — exercises `BoundedWindowPlanner` directly.
+struct BoundedWindowPlannerTests {
+
+    /// v2.1 / 4-spk constants. `chunkLenEmb = chunkLen = 188`, halos = 16 mel frames each.
+    private func makePlanner() -> BoundedWindowPlanner {
+        BoundedWindowPlanner(
+            hop: 160,
+            nFft: 512,
+            winLength: 400,
+            subsamplingFactor: 8,
+            chunkLenEmb: 188,
+            haloLeftMel: 16,
+            haloRightMel: 16
+        )
+    }
+
+    /// `C` = chunkLenEmb * subsamplingFactor = NEW mel frames consumed per interior step.
+    private var stepMelFrames: Int { 188 * 8 } // 1504
+
+    /// Mel frames a full-file `extractMelFeatures` produces for `n` samples
+    /// (constant pad `nFft/2` both sides; `numFrames = 1 + n/hop`).
+    private func melFramesForSamples(_ n: Int) -> Int { 1 + n / 160 }
+
+    @Test func haloInvariants() {
+        let p = makePlanner()
+        #expect(p.haloLeftMel % p.subsamplingFactor == 0, "H_L must align to the embedding grid")
+        #expect(p.haloRightMel % p.subsamplingFactor == 0, "H_R must align to the embedding grid")
+    }
+
+    @Test func interiorStep() {
+        let p = makePlanner()
+        let totalSamples = 16000 * 60 // 60 s — plenty of room either side
+        let g0 = stepMelFrames * 2    // an interior step, far from both ends
+        let spec = p.plan(g0: g0, totalKnownSamples: totalSamples, eof: false)
+
+        #expect(spec.rawStart % p.hop == 0, "rawStart must be hop-aligned")
+        #expect(spec.discardLeftEmb == 2, "interior discards H_L/8 = 2 left-halo emb frames")
+        #expect(spec.chunkEmbCount == 188, "interior chunk emits chunkLenEmb frames")
+        #expect(spec.rcEmbCount == 1, "interior right-context = 1 emb frame")
+        // window = left halo + chunk + right halo (all mel frames)
+        #expect(spec.melWindowStart == g0 - p.haloLeftMel, "window starts one left-halo before g0")
+        #expect(spec.melWindowFrameCount == p.haloLeftMel + stepMelFrames + p.haloRightMel,
+                "window spans H_L + C + H_R mel frames")
+        #expect(spec.newMelFrames == stepMelFrames, "interior step consumes exactly C new mel frames")
+        // raw range actually contains the window's mel-frame centers
+        #expect(spec.rawStart == spec.melWindowStart * p.hop, "hop-aligned to window start, no pad offset")
+        #expect(spec.rawEnd <= totalSamples, "must not read past known samples")
+        #expect(spec.rawEnd > spec.rawStart, "non-empty raw range")
+    }
+
+    @Test func firstStep() {
+        let p = makePlanner()
+        let totalSamples = 16000 * 60
+        let spec = p.plan(g0: 0, totalKnownSamples: totalSamples, eof: false)
+
+        #expect(spec.discardLeftEmb == 0, "first step has no left halo to discard")
+        #expect(spec.rawStart == 0, "first step starts at sample 0")
+        #expect(spec.melWindowStart == 0, "first step window begins at global mel frame 0")
+        #expect(spec.chunkEmbCount == 188, "first step still emits a full chunk")
+        #expect(spec.rcEmbCount == 1, "right context available")
+        #expect(spec.newMelFrames == stepMelFrames)
+    }
+
+    /// No drift: walking contiguous steps over a known total must consume every NEW mel
+    /// frame in `[0, totalMelFrames)` exactly once — no gap, no overlap — and the chunk
+    /// emb-frame counts must sum to the full-file embedding-frame count.
+    @Test func noDriftAcrossContiguousSteps() {
+        let p = makePlanner()
+        // A total that is NOT a multiple of C, so the final EOF step is partial.
+        let totalSamples = 16000 * 91 + 137
+        let totalMel = melFramesForSamples(totalSamples)
+
+        var consumed = [Int](repeating: 0, count: totalMel)
+        var sumChunkEmb = 0
+        var g0 = 0
+        var guardSteps = 0
+        while g0 < totalMel {
+            let eof = g0 + stepMelFrames >= totalMel
+            let spec = p.plan(g0: g0, totalKnownSamples: totalSamples, eof: eof)
+            #expect(spec.newMelFrames > 0, "every step must make progress")
+            for k in g0..<(g0 + spec.newMelFrames) {
+                consumed[k] += 1
+            }
+            sumChunkEmb += spec.chunkEmbCount
+            g0 += spec.newMelFrames
+            guardSteps += 1
+            #expect(guardSteps < 10_000, "step loop must terminate")
+        }
+
+        #expect(consumed.allSatisfy { $0 == 1 }, "each NEW mel frame consumed exactly once")
+        // full-file embedding frame count = floor((L-1)/2)+1 applied 3x
+        var fullEmb = totalMel
+        for _ in 0..<3 { fullEmb = (fullEmb - 1) / 2 + 1 }
+        #expect(sumChunkEmb == fullEmb, "chunk emb counts telescope to the full-file emb count")
+    }
+
+    /// EOF step with no future frames: right-context shrinks to 0 and the chunk emits only
+    /// the remaining new frames; nothing is read past `totalKnownSamples`.
+    @Test func eofStepNoFuture() {
+        let p = makePlanner()
+        // total = one full step + 8 extra mel frames => second step is a tiny partial chunk.
+        let extraMel = 8
+        let totalSamples = (stepMelFrames + extraMel - 1) * p.hop // melFramesForSamples => C + 8
+        let totalMel = melFramesForSamples(totalSamples)
+        #expect(totalMel == stepMelFrames + extraMel, "fixture sets up a C+8 mel total")
+
+        let g0 = stepMelFrames
+        let spec = p.plan(g0: g0, totalKnownSamples: totalSamples, eof: true)
+
+        #expect(spec.newMelFrames == extraMel, "chunk processes only the remaining new mel frames")
+        #expect(spec.rcEmbCount == 0, "no future frames => rc shrinks to min(1, 0) = 0")
+        #expect(spec.rawEnd <= totalSamples, "must not read past known samples at EOF")
+        #expect(spec.melWindowStart + spec.melWindowFrameCount <= totalMel,
+                "window must not extend past the known mel frames")
+    }
+
+    /// EOF-adjacent step where some future frames remain but fewer than H_R: rc must be
+    /// `min(1, availableFutureEmb)` and stay 1 when at least one future emb frame exists.
+    @Test func eofStepPartialFuture() {
+        let p = makePlanner()
+        // total = C + 4 mel frames: step 1 has a full chunk but only 4 future mel frames (< H_R=16).
+        let futureMel = 4
+        let totalSamples = (stepMelFrames + futureMel - 1) * p.hop
+        let totalMel = melFramesForSamples(totalSamples)
+        #expect(totalMel == stepMelFrames + futureMel)
+
+        let spec = p.plan(g0: 0, totalKnownSamples: totalSamples, eof: false)
+        #expect(spec.newMelFrames == stepMelFrames, "step 1 still consumes a full C")
+        #expect(spec.rcEmbCount == 1, "4 future mel frames yield 1 emb frame => rc = min(1, 1) = 1")
+        #expect(spec.rawEnd <= totalSamples)
+    }
+}
