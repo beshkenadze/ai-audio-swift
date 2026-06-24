@@ -3,9 +3,8 @@
 Memory-bounded long-form streaming speaker diarization benchmark host for the Sortformer
 model (`SortformerModel.generateStreamBounded`).
 
-`SortformerModel` exposes three inference paths (see the methods in
-`Sources/MLXAudioVAD/Models/Sortformer/Sortformer.swift` and the
-[design doc](../../../docs/plans/2026-06-24-sortformer-bounded-streaming-design.md)):
+`SortformerModel` exposes three inference paths (see the doc comments on the methods in
+`Sources/MLXAudioVAD/Models/Sortformer/Sortformer.swift`):
 
 - `generate(audio:)` — offline single forward pass; lowest latency for short clips; OOMs on long audio.
 - `generateStream(audio:)` — precompute streaming; takes the whole `MLXArray`, not memory-bounded.
@@ -53,5 +52,6 @@ swift build --product mlx-audio-swift-diar
 - Peak process RSS (`task_info` / `MACH_TASK_BASIC_INFO`)
 - MLX peak memory (`MLX.Memory.peakMemory`)
 
-Measured results (67.6-min file: flat memory, flat latency) are recorded in
-[`bench/REPORT.md`](../../../bench/REPORT.md).
+On a ~68-minute recording the bounded path runs at flat memory (well under 1 GB MLX peak, not
+scaling with duration) and flat per-chunk latency, and `--self-check` confirms it is bit-faithful
+to the precompute path.
