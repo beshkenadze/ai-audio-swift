@@ -1126,13 +1126,19 @@ public class SortformerModel: Module {
                         mel = mel[0..., 0..., ..<keep]
 
                         // 5. preEncode the window once -> embeddings.
+                        // Cast to the model dtype (fp16 for v2.1-fp16) before the encoder,
+                        // matching streamingStep/callAsFunction — extractMelFeatures returns
+                        // float32, and feeding that raw would diverge precision from (or trap
+                        // against) the fp16 spkcache/fifo in streamingStepFromEmbeddings.
                         let (emb, _) = model.fcEncoder.preEncode(
-                            mel, length: MLXArray([Int32(keep)])
+                            mel.asType(model.modelDtype), length: MLXArray([Int32(keep)])
                         )
                         let producedEmb = emb.dim(1)
                         let chunkEnd = spec.discardLeftEmb + spec.chunkEmbCount
                         let rcEnd = chunkEnd + spec.rcEmbCount
-                        assert(
+                        // precondition (not assert): the diar CLI runs RELEASE, where assert is
+                        // compiled out — keep this frame-accounting backstop live there too.
+                        precondition(
                             producedEmb >= rcEnd,
                             "preEncode produced \(producedEmb) emb frames but planner expected at least "
                             + "\(rcEnd) (discardLeft=\(spec.discardLeftEmb) + chunk=\(spec.chunkEmbCount) "
