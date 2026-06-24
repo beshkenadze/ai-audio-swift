@@ -675,16 +675,34 @@ public class SortformerModel: Module {
         state: StreamingState,
         rightContextEmbs: MLXArray? = nil
     ) -> (MLXArray, StreamingState) {
-        let mc = config.modulesConfig
-        let useContext = mc.useAosc
-        let lc = useContext ? mc.chunkLeftContext : 0
-        let rc = useContext ? mc.chunkRightContext : 0
-
         // Pre-encode chunk through ConvSubsampling
         let chunkFeat = chunkFeatures.asType(modelDtype)
         var (chunkEmbs, chunkEmbLengths) = fcEncoder.preEncode(chunkFeat, length: chunkLength)
         let chunkDiarLen = Int(chunkEmbLengths[0].item(Int32.self))
         chunkEmbs = chunkEmbs[0..., ..<chunkDiarLen, 0...]
+        return streamingStepFromEmbeddings(
+            chunkEmbs: chunkEmbs,
+            chunkDiarLen: chunkDiarLen,
+            state: state,
+            rightContextEmbs: rightContextEmbs
+        )
+    }
+
+    /// Run the streaming encoder/transformer pass given already pre-encoded chunk
+    /// embeddings (chunk frames only — no left-halo or right-context frames).
+    ///
+    /// `chunkEmbs` must contain exactly the new chunk's emb frames, because
+    /// `chunkStart = spkcacheLen + fifoLen + leftCtxLen` depends on it.
+    func streamingStepFromEmbeddings(
+        chunkEmbs: MLXArray,
+        chunkDiarLen: Int,
+        state: StreamingState,
+        rightContextEmbs: MLXArray? = nil
+    ) -> (MLXArray, StreamingState) {
+        let mc = config.modulesConfig
+        let useContext = mc.useAosc
+        let lc = useContext ? mc.chunkLeftContext : 0
+        let rc = useContext ? mc.chunkRightContext : 0
 
         // Build left context from end of FIFO
         var leftCtx: MLXArray? = nil
