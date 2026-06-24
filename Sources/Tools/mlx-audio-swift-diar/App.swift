@@ -213,58 +213,63 @@ final class WindowedAudioReader: @unchecked Sendable {
         self.inputBuffer = inputBuffer
     }
 
-    /// Pull the next 16 kHz mono block. Returns nil at end-of-stream.
+    /// Pull the next 16 kHz mono block. Returns nil at end-of-stream, and NEVER a non-nil
+    /// empty block: a zero-produce-but-not-drained transient (e.g. the converter needs more
+    /// input) is retried internally. Each retry's input block reads another native window,
+    /// advancing the file, so the loop is bounded — it always reaches frames or EOF.
     func next() throws -> [Float]? {
-        if converterDrained { return nil }
+        while true {
+            if converterDrained { return nil }
 
-        outputBuffer.frameLength = 0
-        var conversionError: NSError?
+            outputBuffer.frameLength = 0
+            var conversionError: NSError?
 
-        let status = converter.convert(to: outputBuffer, error: &conversionError) { [self] _, outStatus in
-            // Input block: read the next native window from the file. Signals endOfStream once
-            // the file is exhausted, so the converter flushes any buffered tail.
-            if fileExhausted {
-                outStatus.pointee = .endOfStream
-                return nil
+            let status = converter.convert(to: outputBuffer, error: &conversionError) { [self] _, outStatus in
+                // Input block: read the next native window from the file. Signals endOfStream once
+                // the file is exhausted, so the converter flushes any buffered tail.
+                if fileExhausted {
+                    outStatus.pointee = .endOfStream
+                    return nil
+                }
+                do {
+                    inputBuffer.frameLength = 0
+                    try file.read(into: inputBuffer, frameCount: nativeWindowFrames)
+                } catch {
+                    // A genuine mid-file decode error truncates the stream. Warn on stderr so a
+                    // corrupt run is not mistaken for a clean one, then end the stream gracefully.
+                    fputs("warning: audio read failed mid-file, ending stream early: \(error.localizedDescription)\n", stderr)
+                    fileExhausted = true
+                    outStatus.pointee = .endOfStream
+                    return nil
+                }
+                if inputBuffer.frameLength == 0 {
+                    fileExhausted = true
+                    outStatus.pointee = .endOfStream
+                    return nil
+                }
+                outStatus.pointee = .haveData
+                return inputBuffer
             }
-            do {
-                inputBuffer.frameLength = 0
-                try file.read(into: inputBuffer, frameCount: nativeWindowFrames)
-            } catch {
-                // Surface read failures by ending the stream; the outer convert() returns and
-                // we treat it as drained (the error itself is non-fatal flush behaviour).
-                fileExhausted = true
-                outStatus.pointee = .endOfStream
-                return nil
+
+            if let conversionError {
+                throw AppError.audioReadFailed(conversionError.localizedDescription)
             }
-            if inputBuffer.frameLength == 0 {
-                fileExhausted = true
-                outStatus.pointee = .endOfStream
-                return nil
+
+            if status == .endOfStream {
+                converterDrained = true
             }
-            outStatus.pointee = .haveData
-            return inputBuffer
-        }
 
-        if let conversionError {
-            throw AppError.audioReadFailed(conversionError.localizedDescription)
-        }
+            let produced = Int(outputBuffer.frameLength)
+            if produced > 0 {
+                guard let channel = outputBuffer.floatChannelData?[0] else {
+                    throw AppError.audioReadFailed("converter produced frames but floatChannelData was nil")
+                }
+                return Array(UnsafeBufferPointer(start: channel, count: produced))
+            }
 
-        let produced = Int(outputBuffer.frameLength)
-        if status == .endOfStream {
-            converterDrained = true
-            if produced == 0 { return nil }
+            // produced == 0: drained -> EOF; otherwise loop and pull more input (file advances).
+            if converterDrained { return nil }
         }
-        if produced == 0 {
-            // No frames this call but not end-of-stream (e.g. .inputRanDry transient): nil only if
-            // truly drained, otherwise an empty block keeps the caller's pull loop progressing.
-            return converterDrained ? nil : []
-        }
-
-        guard let channel = outputBuffer.floatChannelData?[0] else {
-            throw AppError.audioReadFailed("converter produced frames but floatChannelData was nil")
-        }
-        return Array(UnsafeBufferPointer(start: channel, count: produced))
     }
 }
 
