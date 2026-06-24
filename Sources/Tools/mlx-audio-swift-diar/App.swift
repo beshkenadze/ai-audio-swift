@@ -320,12 +320,12 @@ func median(_ values: [Double]) -> Double {
 @main
 enum App {
     static func main() async {
-        // CRITICAL: cap MLX/Metal memory FIRST, before any MLXArray allocation. Uncapped MLX can
-        // OOM-reboot the machine. 18 GiB hard cap (project policy). See note below on the symbol.
-        capMLXMemory(bytes: 18 * 1024 * 1024 * 1024)
-
         do {
             let args = try CLI.parse()
+            // CRITICAL: cap MLX/Metal memory before any model load / MLXArray allocation (uncapped
+            // MLX can OOM-reboot the machine). Set AFTER parsing so `--help` and argument errors
+            // don't initialize Metal first — `Memory.memoryLimit` touches the device. 18 GiB cap.
+            capMLXMemory(bytes: 18 * 1024 * 1024 * 1024)
             try await run(args)
         } catch {
             fputs("Error: \(error)\n", stderr)
@@ -448,12 +448,23 @@ enum App {
         print("Loading Sortformer model (\(args.repo))")
         let model = try await SortformerModel.fromPretrained(args.repo)
 
-        // Load the SHORT clip FULLY as one mono [Float] @ 16 kHz, then slice to --max-seconds.
-        let (sr, audioArray) = try loadAudioArray(from: inputURL, sampleRate: 16000)
-        var samples = audioArray.asArray(Float.self)
+        // Load the clip as one mono [Float] @ 16 kHz. With --max-seconds, read only that budget
+        // incrementally via the windowed reader so a self-check on a long file never decodes the
+        // whole thing; otherwise load fully (self-check is meant for short clips).
+        let sr = 16000
+        var samples: [Float]
         if let maxSeconds = args.maxSeconds {
             let budget = Int(maxSeconds * Double(sr))
+            let reader = try WindowedAudioReader(url: inputURL, targetSampleRate: Double(sr))
+            samples = []
+            samples.reserveCapacity(budget)
+            while samples.count < budget, let block = try reader.next() {
+                samples.append(contentsOf: block)
+            }
             if samples.count > budget { samples = Array(samples.prefix(budget)) }
+        } else {
+            let (_, audioArray) = try loadAudioArray(from: inputURL, sampleRate: sr)
+            samples = audioArray.asArray(Float.self)
         }
         let clipDurationSec = Double(samples.count) / Double(sr)
         print(String(format: "Self-check clip: %.2f s @ %d Hz (%d samples)", clipDurationSec, sr, samples.count))

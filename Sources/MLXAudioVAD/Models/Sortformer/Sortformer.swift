@@ -1086,6 +1086,29 @@ public class SortformerModel: Module {
                 ))
                 chunkLenEmb = max(chunkLenEmb, 1)
 
+                // Guard the transformer's learned positional table. One streamingStep forward runs
+                // the encoder over [spkcache + fifo + leftCtx + chunk + rightCtx]; if that can
+                // exceed maxSourcePositions, the positional Embedding is indexed out of bounds and
+                // crashes deep in the encoder. A large chunkDuration is the cause — fail fast with
+                // a clear message and the largest safe duration instead.
+                let lc = mc.useAosc ? mc.chunkLeftContext : 0
+                let rc = mc.useAosc ? mc.chunkRightContext : 0
+                let maxPositions = model.config.tfEncoderConfig.maxSourcePositions
+                let worstCasePositions = spkcacheMax + fifoMax + lc + chunkLenEmb + rc
+                if worstCasePositions > maxPositions {
+                    let maxChunkEmb = max(1, maxPositions - (spkcacheMax + fifoMax + lc + rc))
+                    let maxChunkSec = Float(maxChunkEmb) * frameDuration
+                    continuation.finish(throwing: NSError(
+                        domain: "SortformerModel", code: 2,
+                        userInfo: [NSLocalizedDescriptionKey:
+                            "chunkDuration \(chunkDuration)s (\(chunkLenEmb) emb frames) exceeds the "
+                            + "transformer positional capacity: spkcacheMax(\(spkcacheMax)) + "
+                            + "fifoMax(\(fifoMax)) + ctx(\(lc + rc)) + chunk(\(chunkLenEmb)) > "
+                            + "maxSourcePositions(\(maxPositions)). Use chunkDuration <= "
+                            + "~\(String(format: "%.0f", maxChunkSec))s."]))
+                    return
+                }
+
                 let planner = BoundedWindowPlanner(
                     hop: hop,
                     nFft: nFft,
