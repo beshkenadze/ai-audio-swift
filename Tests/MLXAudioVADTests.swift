@@ -1337,6 +1337,8 @@ struct PCMAccumulatorTests {
             // 1. Append one step of fresh PCM (values encode absolute index for slice correctness).
             let block = (0..<step).map { Float(g0 + $0) }
             acc.append(block)
+            // Peak working set is right after append, before the drop frees the tail.
+            retainedHigh = max(retainedHigh, acc.retainedCount)
 
             // 2. Slice the window: left halo (clamped at stream start) + this step.
             let winStart = max(0, g0 - halo)
@@ -1348,13 +1350,12 @@ struct PCMAccumulatorTests {
             // 3. Advance, then drop everything the NEXT window won't need (keep only its left halo).
             g0 += step
             acc.drop(beforeAbsolute: max(0, g0 - halo))
-
-            retainedHigh = max(retainedHigh, acc.retainedCount)
         }
 
-        // Memory is flat: bounded by one step + one halo, regardless of the 50 iterations / ~75k samples.
-        #expect(retainedHigh <= step + halo,
-                "retained memory must stay <= one step + halo (got \(retainedHigh))")
+        // Memory is flat: the true peak working set (post-append, pre-drop) is exactly one
+        // step + one halo, regardless of the 50 iterations / ~75k samples — proving no growth.
+        #expect(retainedHigh == step + halo,
+                "peak retained memory must equal one step + halo (got \(retainedHigh))")
         #expect(acc.totalAppendedCount == step * 50, "all samples were seen")
     }
 }
