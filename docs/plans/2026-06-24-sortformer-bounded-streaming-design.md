@@ -91,7 +91,7 @@ To compute mel frames for a step **exactly equal to the full-file mel** (no boun
 
 **Per step `i`** (let `g0` = global mel index of the first new frame):
 1. Window mel range `[g0 − H_L, g0 + C + H_R)` (clamp left at 0 for the first step; clamp/​shrink right at EOF).
-2. Raw samples needed: `[(g0 − H_L)·hop − nFft/2, (g0 + C + H_R)·hop + nFft/2)` — pulled from the accumulator (absolute-sample addressed). Window start is hop-aligned by construction.
+2. Raw samples needed: `[(g0 − H_L)·hop, (g0 + C + H_R)·hop + nFft/2)` — pulled from the accumulator (absolute-sample addressed). The window start is **hop-aligned** (`= melWindowStart·hop`, no `−nFft/2`): the sub-window's own STFT center-pad supplies the left `nFft/2` margin internally. The first ~2 mel frames are therefore zero-pad-contaminated, but they fall inside the discarded `H_L` left halo, so kept chunk frames see only real audio. (Earlier drafts subtracted `nFft/2` from the start, which broke hop-alignment and the `frame j ≡ global a+j` mapping — corrected during Task 3.)
 3. `extractMelFeatures(window, normalize: nil, padTo: 0)` → slice the aligned interior so the result is exactly global frames `[g0 − H_L, g0 + C + H_R)`.
 4. `preEncode(melWindow)` once → emb frames. Discard the first `H_L/8 = 2` (left-halo) emb frames. The next `chunkLen` emb frames are **chunk embeddings**; the following `rc` emb frames are **right context**; discard the rest.
 5. `streamingStepFromEmbeddings(chunkEmbs, chunkLen, state, rightContextEmbs: rcEmbs)`.
