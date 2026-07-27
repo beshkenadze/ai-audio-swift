@@ -4,6 +4,9 @@ import MLXNN
 import MLXAudioCore
 import MLXLMCommon
 import HuggingFace
+#if canImport(CoreML)
+import CoreML
+#endif
 
 public final class ParakeetModel: Module, STTGenerationModel {
     public enum Variant: Sendable {
