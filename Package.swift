@@ -1,5 +1,6 @@
 // swift-tools-version:6.2
 import PackageDescription
+import Foundation
 
 let package = Package(
     name: "MLXAudio",
@@ -37,27 +38,6 @@ let package = Package(
             name: "MLXAudio",
             targets: ["MLXAudioCore", "MLXAudioCodecs", "MLXAudioTTS", "MLXAudioSTT", "MLXAudioVAD", "MLXAudioLID", "MLXAudioSTS", "MLXAudioUI", "MLXAudioG2P"]
         ),
-        .executable(
-            name: "mlx-audio-swift-tts",
-            targets: ["mlx-audio-swift-tts"],
-        ),
-        .executable(
-            name: "mlx-audio-swift-codec",
-            targets: ["mlx-audio-swift-codec"],
-        ),
-        .executable(
-            name: "mlx-audio-swift-sts",
-            targets: ["mlx-audio-swift-sts"],
-        ),
-        .executable(
-            name: "mlx-audio-swift-stt",
-            targets: ["mlx-audio-swift-stt"],
-        ),
-        .executable(
-            name: "mlx-audio-swift-lid",
-            targets: ["mlx-audio-swift-lid"],
-        ),
-
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift.git", .upToNextMajor(from: "0.30.6")),
@@ -233,46 +213,6 @@ let package = Package(
             path: "Sources/MLXAudioUI"
         ),
         
-        .executableTarget(
-            name: "mlx-audio-swift-tts",
-            dependencies: ["MLXAudioCore", "MLXAudioTTS", "MLXAudioSTT"],
-            path: "Sources/Tools/mlx-audio-swift-tts",
-            exclude: [
-                "README.md",
-            ]
-        ),
-        .executableTarget(
-            name: "mlx-audio-swift-codec",
-            dependencies: ["MLXAudioCore", "MLXAudioCodecs"],
-            path: "Sources/Tools/mlx-audio-swift-codec",
-            exclude: [
-                "README.md",
-            ]
-        ),
-        .executableTarget(
-            name: "mlx-audio-swift-sts",
-            dependencies: ["MLXAudioCore", "MLXAudioSTS"],
-            path: "Sources/Tools/mlx-audio-swift-sts",
-            exclude: [
-                "README.md",
-            ]
-        ),
-        .executableTarget(
-            name: "mlx-audio-swift-stt",
-            dependencies: ["MLXAudioCore", "MLXAudioSTT"],
-            path: "Sources/Tools/mlx-audio-swift-stt",
-            exclude: [
-                "README.md",
-            ]
-        ),
-        .executableTarget(
-            name: "mlx-audio-swift-lid",
-            dependencies: ["MLXAudioCore", "MLXAudioLID"],
-            path: "Sources/Tools/mlx-audio-swift-lid",
-            exclude: [
-                "README.md",
-            ]
-        ),
 
         // MARK: - Tests
         .testTarget(
@@ -285,7 +225,6 @@ let package = Package(
                 "MLXAudioVAD",
                 "MLXAudioSTS",
                 "MLXAudioLID",
-                "mlx-audio-swift-lid",
                 "MLXAudioG2P",
             ],
             path: "Tests",
@@ -295,3 +234,39 @@ let package = Package(
         ),
     ]
 )
+
+// CLI Tools are dev-only macOS utilities. They are excluded from the default and
+// consumer (Tuist/iOS) package graph — which only needs the libraries — and are
+// built only when MLXAUDIO_BUILD_TOOLS is set. This keeps iOS App Bench consumers
+// from resolving non-iOS executable targets.
+if ProcessInfo.processInfo.environment["MLXAUDIO_BUILD_TOOLS"] != nil {
+    package.products += [
+        .executable(name: "mlx-audio-swift-tts", targets: ["mlx-audio-swift-tts"]),
+        .executable(name: "mlx-audio-swift-codec", targets: ["mlx-audio-swift-codec"]),
+        .executable(name: "mlx-audio-swift-sts", targets: ["mlx-audio-swift-sts"]),
+        .executable(name: "mlx-audio-swift-stt", targets: ["mlx-audio-swift-stt"]),
+        .executable(name: "mlx-audio-swift-lid", targets: ["mlx-audio-swift-lid"]),
+    ]
+    package.targets += [
+        .executableTarget(
+            name: "mlx-audio-swift-tts",
+            dependencies: ["MLXAudioCore", "MLXAudioTTS", "MLXAudioSTT"],
+            path: "Sources/Tools/mlx-audio-swift-tts", exclude: ["README.md"]),
+        .executableTarget(
+            name: "mlx-audio-swift-codec",
+            dependencies: ["MLXAudioCore", "MLXAudioCodecs"],
+            path: "Sources/Tools/mlx-audio-swift-codec", exclude: ["README.md"]),
+        .executableTarget(
+            name: "mlx-audio-swift-sts",
+            dependencies: ["MLXAudioCore", "MLXAudioSTS"],
+            path: "Sources/Tools/mlx-audio-swift-sts", exclude: ["README.md"]),
+        .executableTarget(
+            name: "mlx-audio-swift-stt",
+            dependencies: ["MLXAudioCore", "MLXAudioSTT"],
+            path: "Sources/Tools/mlx-audio-swift-stt", exclude: ["README.md"]),
+        .executableTarget(
+            name: "mlx-audio-swift-lid",
+            dependencies: ["MLXAudioCore", "MLXAudioLID"],
+            path: "Sources/Tools/mlx-audio-swift-lid", exclude: ["README.md"]),
+    ]
+}
