@@ -363,21 +363,28 @@ public final class ParakeetModel: Module, STTGenerationModel {
 
     #if canImport(CoreML)
     /// Route the Conformer encoder through CoreML/ANE; decoder and chunking stay in MLX.
-    public func enableCoreMLEncoder(modelURL: URL, fixedFrames: Int = 1000) throws {
+    public func enableCoreMLEncoder(
+        modelURL: URL, fixedFrames: Int = 1000, computeUnits: MLComputeUnits = .all
+    ) throws {
         coreMLEncoder = try ParakeetCoreMLEncoder(
             modelURL: modelURL,
             featIn: encoderConfig.featIn,
             fixedFrames: fixedFrames,
             subsamplingFactor: encoderConfig.subsamplingFactor,
-            dModel: encoderConfig.dModel
+            dModel: encoderConfig.dModel,
+            computeUnits: computeUnits
         )
         encoderExecutionImplementation = .coreML
     }
 
     /// Download a CoreML encoder `.mlpackage` from a Hugging Face repo, then route through it.
-    public func enableCoreMLEncoder(repo: String, cache: HubCache = .default) async throws {
+    /// `computeUnits` pins the Core ML execution units (e.g. `.cpuAndNeuralEngine` to
+    /// keep the Conformer encoder off the GPU); defaults to `.all` (Core ML chooses).
+    public func enableCoreMLEncoder(
+        repo: String, cache: HubCache = .default, computeUnits: MLComputeUnits = .all
+    ) async throws {
         let url = try await Self.downloadANEEncoderPackage(repo: repo, cache: cache)
-        try enableCoreMLEncoder(modelURL: url)
+        try enableCoreMLEncoder(modelURL: url, computeUnits: computeUnits)
     }
 
     static func downloadANEEncoderPackage(repo: String, cache: HubCache = .default) async throws -> URL {
