@@ -122,6 +122,24 @@ public final class ParakeetModel: Module, STTGenerationModel {
         audio: MLXArray,
         generationParameters: STTGenerateParameters
     ) -> STTOutput {
+        let result = generateAligned(audio: audio, generationParameters: generationParameters)
+        return STTOutput(
+            text: result.text,
+            segments: result.segments,
+            language: generationParameters.language
+        )
+    }
+
+    /// The same decode as `generate`, returning the aligned result whole.
+    ///
+    /// Every sub-word token keeps the frame-derived `start`/`duration` that `STTOutput` drops:
+    /// `NemoAlignedResult.segments` flattens each sentence to `["text", "start", "end"]`, so a
+    /// caller holding an `STTOutput` can only interpolate word times from sentence bounds. Callers
+    /// that need word- or token-level timing must use this instead.
+    public func generateAligned(
+        audio: MLXArray,
+        generationParameters: STTGenerateParameters
+    ) -> ParakeetAlignedResult {
         let audio1D = normalizeAudioToMono(audio)
         let sampleRate = preprocessConfig.sampleRate
         let totalSamples = audio1D.shape[0]
@@ -173,11 +191,7 @@ public final class ParakeetModel: Module, STTGenerationModel {
             result = ParakeetAlignment.sentencesToResult(ParakeetAlignment.tokensToSentences(allTokens))
         }
 
-        return STTOutput(
-            text: result.text,
-            segments: result.segments,
-            language: generationParameters.language
-        )
+        return result
     }
 
     public func generateBatch(
