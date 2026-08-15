@@ -198,6 +198,21 @@ public final class ParakeetModel: Module, STTGenerationModel {
         audios: [MLXArray],
         generationParameters: STTGenerateParameters = STTGenerateParameters()
     ) throws -> [STTOutput] {
+        try generateAlignedBatch(audios: audios, generationParameters: generationParameters).map {
+            STTOutput(
+                text: $0.text,
+                segments: $0.segments,
+                language: generationParameters.language
+            )
+        }
+    }
+
+    /// Batch counterpart to `generateAligned` — see that method for why `STTOutput` is not enough
+    /// when the caller needs word- or token-level timing.
+    public func generateAlignedBatch(
+        audios: [MLXArray],
+        generationParameters: STTGenerateParameters = STTGenerateParameters()
+    ) throws -> [ParakeetAlignedResult] {
         guard !audios.isEmpty else {
             throw STTError.invalidInput("Parakeet generateBatch requires at least one chunk-sized audio input.")
         }
@@ -216,14 +231,7 @@ public final class ParakeetModel: Module, STTGenerationModel {
         }
 
         let batchFeatures = makeBatchFeatures(audios)
-        let results = decode(mel: batchFeatures.features, lengths: batchFeatures.lengths)
-        return results.map {
-            STTOutput(
-                text: $0.text,
-                segments: $0.segments,
-                language: generationParameters.language
-            )
-        }
+        return decode(mel: batchFeatures.features, lengths: batchFeatures.lengths)
     }
 
     public func generateStream(
