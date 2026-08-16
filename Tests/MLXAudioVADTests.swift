@@ -1067,3 +1067,320 @@ struct SileroVADNetworkTests {
         }
     }
 }
+
+// MARK: - FIFO Cap (D1) Tests
+
+struct SortformerFifoCapTests {
+
+    /// AOSC v2.1 / 4-spk modules config, decoded from a JSON literal (no memberwise init exists).
+    private func loadSortformerModulesConfigAOSC() throws -> ModulesConfig {
+        let json = """
+        {
+          "num_speakers": 4,
+          "fc_d_model": 512,
+          "tf_d_model": 192,
+          "subsampling_factor": 8,
+          "chunk_len": 188,
+          "fifo_len": 188,
+          "spkcache_len": 188,
+          "spkcache_update_period": 188,
+          "chunk_left_context": 1,
+          "chunk_right_context": 1,
+          "use_aosc": true
+        }
+        """
+        let data = json.data(using: .utf8)!
+        return try JSONDecoder().decode(ModulesConfig.self, from: data)
+    }
+
+    /// Build a StreamingState whose FIFO holds `fifoFrames` frames (spkcache empty).
+    /// Uses small varied (non-zero) preds so the AOSC compression path is not degenerate.
+    private func makeState(fifoFrames: Int, embDim: Int, nSpk: Int) -> StreamingState {
+        let fifo = MLXRandom.uniform(low: -1.0, high: 1.0, [1, fifoFrames, embDim])
+        let fifoPreds = MLXRandom.uniform(low: 0.0, high: 1.0, [1, fifoFrames, nSpk])
+        return StreamingState(
+            spkcache: MLXArray.zeros([1, 0, embDim]),
+            spkcachePreds: MLXArray.zeros([1, 0, nSpk]),
+            fifo: fifo,
+            fifoPreds: fifoPreds,
+            framesProcessed: 0,
+            meanSilEmb: MLXArray.zeros([1, embDim]),
+            nSilFrames: MLXArray.zeros([1])
+        )
+    }
+
+    @Test func testFifoCappedAfterOversizedChunk() throws {
+        let cfg = try loadSortformerModulesConfigAOSC()
+        let embDim = cfg.fcDModel
+        let nSpk = cfg.numSpeakers
+        // FIFO overflow (700) >> spkcacheUpdatePeriod (188): the old code left it > fifoMax.
+        let state = makeState(fifoFrames: 700, embDim: embDim, nSpk: nSpk)
+        let out = SortformerModel.maybeCompressState(
+            state, spkcacheMax: 188, fifoMax: 188, modulesCfg: cfg
+        )
+        #expect(out.fifoLen <= 188, "FIFO must be capped regardless of overflow size")
+        #expect(out.spkcacheLen <= 188, "spkcache must stay capped")
+    }
+}
+
+// MARK: - Bounded Window Planner (frame accounting)
+
+/// Pure `Int` frame-accounting math for the bounded long-form streaming window.
+/// No MLX/Metal required — exercises `BoundedWindowPlanner` directly.
+struct BoundedWindowPlannerTests {
+
+    /// v2.1 / 4-spk constants. `chunkLenEmb = chunkLen = 188`, halos = 16 mel frames each.
+    private func makePlanner() -> BoundedWindowPlanner {
+        BoundedWindowPlanner(
+            hop: 160,
+            nFft: 512,
+            subsamplingFactor: 8,
+            chunkLenEmb: 188,
+            haloLeftMel: 16,
+            haloRightMel: 16
+        )
+    }
+
+    /// `C` = chunkLenEmb * subsamplingFactor = NEW mel frames consumed per interior step.
+    private var stepMelFrames: Int { 188 * 8 } // 1504
+
+    /// Mel frames a full-file `extractMelFeatures` produces for `n` samples
+    /// (constant pad `nFft/2` both sides; `numFrames = 1 + n/hop`).
+    private func melFramesForSamples(_ n: Int) -> Int { 1 + n / 160 }
+
+    @Test func haloInvariants() {
+        let p = makePlanner()
+        #expect(p.haloLeftMel % p.subsamplingFactor == 0, "H_L must align to the embedding grid")
+        #expect(p.haloRightMel % p.subsamplingFactor == 0, "H_R must align to the embedding grid")
+    }
+
+    @Test func interiorStep() {
+        let p = makePlanner()
+        let totalSamples = 16000 * 60 // 60 s — plenty of room either side
+        let g0 = stepMelFrames * 2    // an interior step, far from both ends
+        let spec = p.plan(g0: g0, totalKnownSamples: totalSamples, eof: false)
+
+        #expect(spec.rawStart % p.hop == 0, "rawStart must be hop-aligned")
+        #expect(spec.discardLeftEmb == 2, "interior discards H_L/8 = 2 left-halo emb frames")
+        #expect(spec.chunkEmbCount == 188, "interior chunk emits chunkLenEmb frames")
+        #expect(spec.rcEmbCount == 1, "interior right-context = 1 emb frame")
+        // window = left halo + chunk + right halo (all mel frames)
+        #expect(spec.melWindowStart == g0 - p.haloLeftMel, "window starts one left-halo before g0")
+        #expect(spec.melWindowFrameCount == p.haloLeftMel + stepMelFrames + p.haloRightMel,
+                "window spans H_L + C + H_R mel frames")
+        #expect(spec.newMelFrames == stepMelFrames, "interior step consumes exactly C new mel frames")
+        // raw range actually contains the window's mel-frame centers
+        #expect(spec.rawStart == spec.melWindowStart * p.hop, "hop-aligned to window start, no pad offset")
+        #expect(spec.rawEnd <= totalSamples, "must not read past known samples")
+        #expect(spec.rawEnd > spec.rawStart, "non-empty raw range")
+    }
+
+    @Test func firstStep() {
+        let p = makePlanner()
+        let totalSamples = 16000 * 60
+        let spec = p.plan(g0: 0, totalKnownSamples: totalSamples, eof: false)
+
+        #expect(spec.discardLeftEmb == 0, "first step has no left halo to discard")
+        #expect(spec.rawStart == 0, "first step starts at sample 0")
+        #expect(spec.melWindowStart == 0, "first step window begins at global mel frame 0")
+        #expect(spec.chunkEmbCount == 188, "first step still emits a full chunk")
+        #expect(spec.rcEmbCount == 1, "right context available")
+        #expect(spec.newMelFrames == stepMelFrames)
+    }
+
+    /// No drift: walking contiguous steps over a known total must consume every NEW mel
+    /// frame in `[0, totalMelFrames)` exactly once — no gap, no overlap — and the chunk
+    /// emb-frame counts must sum to the full-file embedding-frame count.
+    @Test func noDriftAcrossContiguousSteps() {
+        let p = makePlanner()
+        // A total that is NOT a multiple of C, so the final EOF step is partial.
+        let totalSamples = 16000 * 91 + 137
+        let totalMel = melFramesForSamples(totalSamples)
+
+        var consumed = [Int](repeating: 0, count: totalMel)
+        var sumChunkEmb = 0
+        var g0 = 0
+        var guardSteps = 0
+        while g0 < totalMel {
+            let eof = g0 + stepMelFrames >= totalMel
+            let spec = p.plan(g0: g0, totalKnownSamples: totalSamples, eof: eof)
+            #expect(spec.newMelFrames > 0, "every step must make progress")
+            for k in g0..<(g0 + spec.newMelFrames) {
+                consumed[k] += 1
+            }
+            sumChunkEmb += spec.chunkEmbCount
+            g0 += spec.newMelFrames
+            guardSteps += 1
+            #expect(guardSteps < 10_000, "step loop must terminate")
+        }
+
+        #expect(consumed.allSatisfy { $0 == 1 }, "each NEW mel frame consumed exactly once")
+        // full-file embedding frame count = floor((L-1)/2)+1 applied 3x
+        var fullEmb = totalMel
+        for _ in 0..<3 { fullEmb = (fullEmb - 1) / 2 + 1 }
+        #expect(sumChunkEmb == fullEmb, "chunk emb counts telescope to the full-file emb count")
+    }
+
+    /// EOF step with no future frames: right-context shrinks to 0 and the chunk emits only
+    /// the remaining new frames; nothing is read past `totalKnownSamples`.
+    @Test func eofStepNoFuture() {
+        let p = makePlanner()
+        // total = one full step + 8 extra mel frames => second step is a tiny partial chunk.
+        let extraMel = 8
+        let totalSamples = (stepMelFrames + extraMel - 1) * p.hop // melFramesForSamples => C + 8
+        let totalMel = melFramesForSamples(totalSamples)
+        #expect(totalMel == stepMelFrames + extraMel, "fixture sets up a C+8 mel total")
+
+        let g0 = stepMelFrames
+        let spec = p.plan(g0: g0, totalKnownSamples: totalSamples, eof: true)
+
+        #expect(spec.newMelFrames == extraMel, "chunk processes only the remaining new mel frames")
+        #expect(spec.rcEmbCount == 0, "no future frames => rc shrinks to min(1, 0) = 0")
+        #expect(spec.rawEnd <= totalSamples, "must not read past known samples at EOF")
+        #expect(spec.melWindowStart + spec.melWindowFrameCount <= totalMel,
+                "window must not extend past the known mel frames")
+    }
+
+    /// EOF-adjacent step where some future frames remain but fewer than H_R: rc must be
+    /// `min(1, availableFutureEmb)` and stay 1 when at least one future emb frame exists.
+    /// Here only 4 future mel frames exist (< H_R = 16), so the right halo is legitimately
+    /// shrunk — which is only allowed at true EOF (`eof: true`); see `rightHaloNotShrunkMidStream`.
+    @Test func eofStepPartialFuture() {
+        let p = makePlanner()
+        // total = C + 4 mel frames: step 1 has a full chunk but only 4 future mel frames (< H_R=16).
+        let futureMel = 4
+        let totalSamples = (stepMelFrames + futureMel - 1) * p.hop
+        let totalMel = melFramesForSamples(totalSamples)
+        #expect(totalMel == stepMelFrames + futureMel)
+
+        let spec = p.plan(g0: 0, totalKnownSamples: totalSamples, eof: true)
+        #expect(spec.newMelFrames == stepMelFrames, "step 1 still consumes a full C")
+        #expect(spec.rcEmbCount == 1, "4 future mel frames yield 1 emb frame => rc = min(1, 1) = 1")
+        #expect(spec.rawEnd <= totalSamples)
+    }
+
+    /// Mid-stream contract (Task-3 review follow-up A): with `eof: false` the caller asserts more
+    /// audio is coming, so the right halo must NOT be shrunk for lack of buffered frames. The planner
+    /// `precondition`s on `futureMel >= haloRightMel`; under-filling it traps loudly instead of
+    /// silently degrading the right-context embeddings.
+    ///
+    /// Swift Testing has no clean in-process "expect this precondition to fire" matcher (a trap aborts
+    /// the test runner), so we assert the BOUNDARY that *just barely satisfies* the contract does NOT
+    /// trap, and document the trap. `futureMel == haloRightMel` is the smallest legal value.
+    @Test func rightHaloNotShrunkMidStream() {
+        let p = makePlanner()
+        // Buffer exactly C (new) + H_R (right halo) mel frames beyond g0=0 — the minimum a mid-stream
+        // step needs. futureMel = totalMel - C = H_R, which satisfies the precondition exactly.
+        let totalMel = stepMelFrames + p.haloRightMel
+        let totalSamples = (totalMel - 1) * p.hop // melFramesForSamples => totalMel
+        #expect(melFramesForSamples(totalSamples) == totalMel)
+
+        // Does not trap: the right halo is full, so the lookahead matches the full-file forward.
+        let spec = p.plan(g0: 0, totalKnownSamples: totalSamples, eof: false)
+        #expect(spec.newMelFrames == stepMelFrames)
+        #expect(spec.rcEmbCount == 1, "a full right halo yields the requested 1 rc emb frame")
+        // NOTE: calling p.plan(g0: 0, totalKnownSamples: (stepMelFrames + 4 - 1)*hop, eof: false) here
+        // — only 4 future mel frames < H_R — WOULD trap by precondition. Not exercised (trap aborts).
+    }
+}
+
+// MARK: - PCM Accumulator (bounded buffer)
+
+struct PCMAccumulatorTests {
+
+    @Test func sliceSpansMultipleBlocks() {
+        var acc = PCMAccumulator()
+        acc.append([0, 1, 2])
+        acc.append([3, 4, 5])
+        acc.append([6, 7, 8])
+        // slice(2, 7) crosses all three blocks.
+        #expect(acc.slice(from: 2, to: 7) == [2, 3, 4, 5, 6])
+    }
+
+    /// Absolute addressing survives a drop: indices stay anchored to the whole stream, so a slice
+    /// of the kept tail still returns the right values. (Slicing below `k` would trap by contract —
+    /// asserted in a comment rather than crash-tested.)
+    @Test func absoluteAddressingSurvivesDrop() {
+        var acc = PCMAccumulator()
+        acc.append([10, 11, 12, 13, 14, 15, 16, 17, 18, 19])
+        let k = 4
+        acc.drop(beforeAbsolute: k)
+        #expect(acc.firstRetainedAbsolute == k)
+        // slice(4, 8) addresses the SAME absolute samples [14,15,16,17] as before the drop.
+        #expect(acc.slice(from: k, to: k + 4) == [14, 15, 16, 17])
+        // slice(from: k - 1, ...) would trap: samples before k are dropped. Contract-asserted only.
+    }
+
+    /// drop frees memory: retainedCount reflects only the kept tail, not the whole stream.
+    @Test func dropFreesMemory() {
+        var acc = PCMAccumulator()
+        acc.append(Array(repeating: 0, count: 100))
+        #expect(acc.retainedCount == 100)
+        acc.drop(beforeAbsolute: 70)
+        #expect(acc.retainedCount == 30, "only the tail [70,100) is retained")
+        #expect(acc.totalAppendedCount == 100, "total seen is unaffected by drops")
+    }
+
+    /// drop is idempotent and re-droppable: dropping at k, then again below/at k, must not corrupt
+    /// state; dropping nothing (index <= base) is a no-op.
+    @Test func dropIsIdempotentAndReDroppable() {
+        var acc = PCMAccumulator()
+        acc.append(Array((0..<20).map { Float($0) }))
+        acc.drop(beforeAbsolute: 8)
+        #expect(acc.firstRetainedAbsolute == 8)
+        #expect(acc.retainedCount == 12)
+
+        // Re-drop at the same index: no change.
+        acc.drop(beforeAbsolute: 8)
+        #expect(acc.firstRetainedAbsolute == 8)
+        #expect(acc.retainedCount == 12)
+
+        // Drop below the current base (already gone): no-op, no corruption.
+        acc.drop(beforeAbsolute: 3)
+        #expect(acc.firstRetainedAbsolute == 8)
+        #expect(acc.retainedCount == 12)
+
+        // Drop at 0 / negative: no-op.
+        acc.drop(beforeAbsolute: 0)
+        #expect(acc.firstRetainedAbsolute == 8)
+
+        // Data is still correct and absolute-addressed after the churn.
+        #expect(acc.slice(from: 8, to: 12) == [8, 9, 10, 11])
+    }
+
+    /// Bounded-memory scenario: mimic the Task-5 sliding loop — each iteration appends one step of
+    /// samples, slices a window (step + a left halo), then drops everything consumed below the next
+    /// step's halo. retainedCount must stay <= (step + halo) and NOT grow with the iteration count.
+    @Test func boundedMemoryAcrossManyIterations() {
+        let step = 1504   // C = chunkLen * subsamplingFactor (~15 s of mel-frame samples, scaled down)
+        let halo = 256     // left halo + STFT margin retained for the next window
+        var acc = PCMAccumulator()
+        var g0 = 0
+        var retainedHigh = 0
+
+        for i in 0..<50 {
+            // 1. Append one step of fresh PCM (values encode absolute index for slice correctness).
+            let block = (0..<step).map { Float(g0 + $0) }
+            acc.append(block)
+            // Peak working set is right after append, before the drop frees the tail.
+            retainedHigh = max(retainedHigh, acc.retainedCount)
+
+            // 2. Slice the window: left halo (clamped at stream start) + this step.
+            let winStart = max(0, g0 - halo)
+            let winEnd = g0 + step
+            let win = acc.slice(from: winStart, to: winEnd)
+            #expect(win.first == Float(winStart), "iter \(i): window starts at the right absolute sample")
+            #expect(win.last == Float(winEnd - 1), "iter \(i): window ends at the right absolute sample")
+
+            // 3. Advance, then drop everything the NEXT window won't need (keep only its left halo).
+            g0 += step
+            acc.drop(beforeAbsolute: max(0, g0 - halo))
+        }
+
+        // Memory is flat: the true peak working set (post-append, pre-drop) is exactly one
+        // step + one halo, regardless of the 50 iterations / ~75k samples — proving no growth.
+        #expect(retainedHigh == step + halo,
+                "peak retained memory must equal one step + halo (got \(retainedHigh))")
+        #expect(acc.totalAppendedCount == step * 50, "all samples were seen")
+    }
+}

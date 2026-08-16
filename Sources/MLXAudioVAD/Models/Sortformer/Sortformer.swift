@@ -560,6 +560,16 @@ public class SortformerModel: Module {
 
     // MARK: - Offline Inference
 
+    /// Offline diarization: a single forward pass over the **whole** file.
+    ///
+    /// Computes mel features and runs the encoders over the entire waveform at once, then decodes
+    /// segments. Lowest latency for SHORT clips, but the whole-file encoder materialises
+    /// activations proportional to total duration, so it **OOMs on long audio** (Metal is hard-capped
+    /// on this machine; a multi-minute file can exceed the budget). Use it when you already hold the
+    /// full `MLXArray` and it comfortably fits — for short clips or one-shot offline jobs.
+    ///
+    /// For medium clips you already hold in memory, prefer `generateStream(audio:)`; for
+    /// long/streaming/unknown-length audio, use `generateStreamBounded(audioSource:)`.
     public func generate(
         audio: MLXArray,
         sampleRate: Int = 16000,
@@ -675,16 +685,34 @@ public class SortformerModel: Module {
         state: StreamingState,
         rightContextEmbs: MLXArray? = nil
     ) -> (MLXArray, StreamingState) {
-        let mc = config.modulesConfig
-        let useContext = mc.useAosc
-        let lc = useContext ? mc.chunkLeftContext : 0
-        let rc = useContext ? mc.chunkRightContext : 0
-
         // Pre-encode chunk through ConvSubsampling
         let chunkFeat = chunkFeatures.asType(modelDtype)
         var (chunkEmbs, chunkEmbLengths) = fcEncoder.preEncode(chunkFeat, length: chunkLength)
         let chunkDiarLen = Int(chunkEmbLengths[0].item(Int32.self))
         chunkEmbs = chunkEmbs[0..., ..<chunkDiarLen, 0...]
+        return streamingStepFromEmbeddings(
+            chunkEmbs: chunkEmbs,
+            chunkDiarLen: chunkDiarLen,
+            state: state,
+            rightContextEmbs: rightContextEmbs
+        )
+    }
+
+    /// Run the streaming encoder/transformer pass given already pre-encoded chunk
+    /// embeddings (chunk frames only — no left-halo or right-context frames).
+    ///
+    /// `chunkEmbs` must contain exactly the new chunk's emb frames, because
+    /// `chunkStart = spkcacheLen + fifoLen + leftCtxLen` depends on it.
+    func streamingStepFromEmbeddings(
+        chunkEmbs: MLXArray,
+        chunkDiarLen: Int,
+        state: StreamingState,
+        rightContextEmbs: MLXArray? = nil
+    ) -> (MLXArray, StreamingState) {
+        let mc = config.modulesConfig
+        let useContext = mc.useAosc
+        let lc = useContext ? mc.chunkLeftContext : 0
+        let rc = useContext ? mc.chunkRightContext : 0
 
         // Build left context from end of FIFO
         var leftCtx: MLXArray? = nil
@@ -742,7 +770,9 @@ public class SortformerModel: Module {
         return (chunkPreds[0], newState)
     }
 
-    /// Feed a single audio chunk and get diarization results.
+    /// Single-chunk live streaming API: feed one audio chunk plus the carried `StreamingState` and
+    /// get this chunk's diarization output and the updated state. The caller owns chunking and state
+    /// threading; the D1 FIFO cap (`maybeCompressState`) bounds `spkcache`/`fifo` here too.
     public func feed(
         chunk: MLXArray,
         state: StreamingState,
@@ -830,7 +860,18 @@ public class SortformerModel: Module {
         }
     }
 
-    /// Process audio in chunks, yielding diarization results incrementally.
+    /// *Precompute* streaming diarization: yields per-chunk results incrementally but still takes the
+    /// full `MLXArray` up front.
+    ///
+    /// It computes whole-file mel features and (for the AOSC/v2.1 path) a whole-file `preEncode` to
+    /// supply right-context, then iterates chunk by chunk. It is therefore **NOT memory-bounded** —
+    /// peak memory and per-chunk latency grow with total duration; on long files it slows and OOMs
+    /// (per the bench, a ~50-min file stalled around 28 GB at ~63 %). Use it for short/medium clips,
+    /// or when you already hold the entire waveform and it fits.
+    ///
+    /// Benefits from the D1 FIFO cap (`maybeCompressState`) — which bounds `spkcache`/`fifo` for all
+    /// streaming paths — but the whole-file precompute remains the duration-scaling cost. For
+    /// long/streaming/unknown-length audio use `generateStreamBounded(audioSource:)` instead.
     public func generateStream(
         audio: MLXArray,
         sampleRate: Int = 16000,
@@ -987,6 +1028,263 @@ public class SortformerModel: Module {
         }
     }
 
+    /// Memory-bounded long-form streaming diarization.
+    ///
+    /// The memory-bounded long-form path: diarizes streaming/unknown-length audio at flat memory
+    /// and flat per-chunk latency, regardless of total duration.
+    ///
+    /// Unlike `generateStream(audio:)` — which materialises whole-file mel features and (for the
+    /// AOSC/v2.1 path) a full-file `preEncode`, so its peak memory scales with total duration —
+    /// this path consumes raw 16 kHz mono PCM incrementally through a pull closure. It processes
+    /// the stream in fixed steps of `C = chunkLenEmb * subsamplingFactor` NEW mel frames over a
+    /// phase-aligned sliding window with left/right halos (see `BoundedWindowPlanner`), so every
+    /// per-step tensor is sized to ~one step + halo regardless of total duration. Combined with the
+    /// D1 FIFO cap (`maybeCompressState`, which bounds `spkcache`/`fifo` for all streaming paths),
+    /// peak memory and per-chunk latency stay flat for multi-hour recordings — the bench runs a
+    /// 67.6-min file at <1 GB MLX peak and ~0.13 s/chunk. Output is bit-faithful to
+    /// `generateStream` (same windowing, just incremental).
+    ///
+    /// The diarization core is format-agnostic: the caller supplies decoding, resampling, and
+    /// downmix to 16 kHz mono PCM via the closure (e.g. the `mlx-audio-swift-diar` tool feeds blocks
+    /// from a windowed `AVAudioFile` + `AVAudioConverter`). Use this for long/streaming/unknown-length
+    /// audio; for short/medium clips you already hold, `generateStream(audio:)` is simpler.
+    ///
+    /// - Parameters:
+    ///   - audioSource: Async pull closure returning the next block of 16 kHz mono PCM `[Float]`;
+    ///     returns `nil` at EOF. Blocks may be any length (re-buffered internally). The `MLXArray`
+    ///     is built inside this method, never passed through the closure (Sendable-clean).
+    ///   - chunkDuration: Target step size in seconds (rounded to the embedding grid; default 15 s
+    ///     = `chunkLen` = 188 emb frames). Any value is safe under the D1 cap.
+    public func generateStreamBounded(
+        audioSource: @escaping () async throws -> [Float]?,
+        sampleRate: Int = 16000,
+        chunkDuration: Float = 15.0,
+        threshold: Float = 0.5,
+        minDuration: Float = 0.0,
+        mergeGap: Float = 0.0,
+        spkcacheMax: Int = 188,
+        fifoMax: Int = 188,
+        verbose: Bool = false
+    ) -> AsyncThrowingStream<DiarizationOutput, Error> {
+        let sendableModel = UncheckedSendableBox(self)
+        let sendableSource = UncheckedSendableBox(audioSource)
+        return AsyncThrowingStream { continuation in
+            let task = Task.detached {
+                let model = sendableModel.value
+                let audioSource = sendableSource.value
+                let proc = model.config.processorConfig
+                let mc = model.config.modulesConfig
+                let subsamplingFactor = model.config.fcEncoderConfig.subsamplingFactor
+                let hop = proc.hopLength
+                let nFft = proc.nFft
+                let frameDuration = Float(hop * subsamplingFactor) / Float(sampleRate)
+
+                // Step size on the embedding grid: round chunkDuration to a whole number of emb
+                // frames, clamp to >= 1, then C = chunkLenEmb * subsamplingFactor NEW mel frames.
+                var chunkLenEmb = Int(round(
+                    chunkDuration * Float(sampleRate) / Float(hop) / Float(subsamplingFactor)
+                ))
+                chunkLenEmb = max(chunkLenEmb, 1)
+
+                // Guard the transformer's learned positional table. One streamingStep forward runs
+                // the encoder over [spkcache + fifo + leftCtx + chunk + rightCtx]; if that can
+                // exceed maxSourcePositions, the positional Embedding is indexed out of bounds and
+                // crashes deep in the encoder. A large chunkDuration is the cause — fail fast with
+                // a clear message and the largest safe duration instead.
+                let lc = mc.useAosc ? mc.chunkLeftContext : 0
+                let rc = mc.useAosc ? mc.chunkRightContext : 0
+                let maxPositions = model.config.tfEncoderConfig.maxSourcePositions
+                let worstCasePositions = spkcacheMax + fifoMax + lc + chunkLenEmb + rc
+                if worstCasePositions > maxPositions {
+                    let maxChunkEmb = max(1, maxPositions - (spkcacheMax + fifoMax + lc + rc))
+                    let maxChunkSec = Float(maxChunkEmb) * frameDuration
+                    continuation.finish(throwing: NSError(
+                        domain: "SortformerModel", code: 2,
+                        userInfo: [NSLocalizedDescriptionKey:
+                            "chunkDuration \(chunkDuration)s (\(chunkLenEmb) emb frames) exceeds the "
+                            + "transformer positional capacity: spkcacheMax(\(spkcacheMax)) + "
+                            + "fifoMax(\(fifoMax)) + ctx(\(lc + rc)) + chunk(\(chunkLenEmb)) > "
+                            + "maxSourcePositions(\(maxPositions)). Use chunkDuration <= "
+                            + "~\(String(format: "%.0f", maxChunkSec))s."]))
+                    return
+                }
+
+                let planner = BoundedWindowPlanner(
+                    hop: hop,
+                    nFft: nFft,
+                    subsamplingFactor: subsamplingFactor,
+                    chunkLenEmb: chunkLenEmb,
+                    haloLeftMel: 16,
+                    haloRightMel: 16,
+                    chunkRightContext: mc.useAosc ? mc.chunkRightContext : 0
+                )
+                let stepMel = planner.stepMelFrames
+                let haloLeftMel = planner.haloLeftMel
+                let haloRightMel = planner.haloRightMel
+
+                // Pull-before-slice gate: a full (non-shrunk) interior window for first-new-frame
+                // `g0` spans mel frames [g0 - H_L, g0 + C + H_R); its raw end (matching the planner)
+                // is (g0 + C + H_R) * hop + nFft/2. We must have buffered at least that many samples
+                // before stepping with eof:false, satisfying BOTH the accumulator's slice precondition
+                // AND the planner's "don't shrink the right halo mid-stream" precondition.
+                func rawEndNeededForFullWindow(_ g0: Int) -> Int {
+                    (g0 + stepMel + haloRightMel) * hop + nFft / 2
+                }
+
+                do {
+                    var acc = PCMAccumulator()
+                    var state = model.initStreamingState()
+                    var g0 = 0                  // global mel index of the first NEW frame this step
+                    var globalDiarFrame = 0     // emitted emb frames so far (time offset accumulator)
+                    var eof = false
+                    var chunkIdx = 0
+
+                    while true {
+                        try Task.checkCancellation()
+
+                        // 1. Pull-before-slice: buffer until a full window is available, or EOF.
+                        while !eof && acc.totalAppendedCount < rawEndNeededForFullWindow(g0) {
+                            if let block = try await audioSource() {
+                                acc.append(block)
+                            } else {
+                                eof = true
+                            }
+                        }
+
+                        // 2. Plan this step against what is now known.
+                        let spec = planner.plan(
+                            g0: g0,
+                            totalKnownSamples: acc.totalAppendedCount,
+                            eof: eof
+                        )
+                        if spec.newMelFrames == 0 { break } // nothing left at EOF
+
+                        // 3. Slice the exact raw window (built into an MLXArray inside this task).
+                        let windowSamples = acc.slice(from: spec.rawStart, to: spec.rawEnd)
+
+                        // 4. Mel for the window (AOSC/v2.1 path: no normalize, no extra pad), then
+                        //    slice to exactly the aligned interior `melWindowFrameCount` frames.
+                        var mel = extractMelFeatures(
+                            MLXArray(windowSamples),
+                            sampleRate: sampleRate,
+                            nFft: nFft,
+                            hopLength: hop,
+                            winLength: proc.winLength,
+                            nMels: proc.featureSize,
+                            preemphasisCoeff: proc.preemphasis,
+                            normalize: nil,
+                            padTo: 0
+                        )
+                        // mel is (1, nMels, frames); the first `melWindowFrameCount` frames are the
+                        // hop-aligned interior corresponding to global frames [melWindowStart, ...).
+                        let melFrames = mel.dim(2)
+                        let keep = min(spec.melWindowFrameCount, melFrames)
+                        mel = mel[0..., 0..., ..<keep]
+
+                        // 5. preEncode the window once -> embeddings.
+                        // Cast to the model dtype (fp16 for v2.1-fp16) before the encoder,
+                        // matching streamingStep/callAsFunction — extractMelFeatures returns
+                        // float32, and feeding that raw would diverge precision from (or trap
+                        // against) the fp16 spkcache/fifo in streamingStepFromEmbeddings.
+                        let (emb, _) = model.fcEncoder.preEncode(
+                            mel.asType(model.modelDtype), length: MLXArray([Int32(keep)])
+                        )
+                        let producedEmb = emb.dim(1)
+                        let chunkEnd = spec.discardLeftEmb + spec.chunkEmbCount
+                        let rcEnd = chunkEnd + spec.rcEmbCount
+                        // precondition (not assert): the diar CLI runs RELEASE, where assert is
+                        // compiled out — keep this frame-accounting backstop live there too.
+                        precondition(
+                            producedEmb >= rcEnd,
+                            "preEncode produced \(producedEmb) emb frames but planner expected at least "
+                            + "\(rcEnd) (discardLeft=\(spec.discardLeftEmb) + chunk=\(spec.chunkEmbCount) "
+                            + "+ rc=\(spec.rcEmbCount)); window=\(keep) mel frames"
+                        )
+
+                        // Chunk frames ONLY (no left halo, no right context).
+                        let chunkEmbs = emb[0..., spec.discardLeftEmb..<chunkEnd, 0...]
+                        var rcEmbs: MLXArray? = nil
+                        if spec.rcEmbCount > 0 {
+                            rcEmbs = emb[0..., chunkEnd..<rcEnd, 0...]
+                        }
+
+                        // 6. Streaming encoder/transformer pass over chunk frames + right context.
+                        let (chunkPreds, newState) = model.streamingStepFromEmbeddings(
+                            chunkEmbs: chunkEmbs,
+                            chunkDiarLen: spec.chunkEmbCount,
+                            state: state,
+                            rightContextEmbs: rcEmbs
+                        )
+                        state = newState
+
+                        // 7. Segments, offset by the global diar-frame counter.
+                        let chunkTimeOffset = Float(globalDiarFrame) * frameDuration
+                        var segments = Self.predsToSegments(
+                            chunkPreds,
+                            frameDuration: frameDuration,
+                            threshold: threshold,
+                            minDuration: minDuration,
+                            mergeGap: mergeGap
+                        )
+                        segments = segments.map {
+                            DiarizationSegment(
+                                start: $0.start + chunkTimeOffset,
+                                end: $0.end + chunkTimeOffset,
+                                speaker: $0.speaker
+                            )
+                        }
+                        globalDiarFrame += spec.chunkEmbCount
+
+                        if verbose {
+                            chunkIdx += 1
+                            let t0 = chunkTimeOffset
+                            let t1 = t0 + Float(chunkPreds.dim(0)) * frameDuration
+                            print("  Chunk \(chunkIdx): \(String(format: "%.2f", t0))s-\(String(format: "%.2f", t1))s  \(segments.count) segments, context=\(state.spkcacheLen)+\(state.fifoLen) frames, retained=\(acc.retainedCount) samples")
+                        }
+
+                        let activeSpeakers = Set(segments.map { $0.speaker })
+                        continuation.yield(DiarizationOutput(
+                            segments: segments,
+                            speakerProbs: chunkPreds,
+                            numSpeakers: activeSpeakers.count
+                        ))
+
+                        // 8. Cap state (D1 true cap). Force-evaluate per-step tensors + state arrays
+                        //    so the lazy graph cannot grow across steps (flat memory).
+                        state = Self.maybeCompressState(
+                            state,
+                            spkcacheMax: spkcacheMax,
+                            fifoMax: fifoMax,
+                            modulesCfg: mc
+                        )
+                        MLX.eval(
+                            chunkPreds,
+                            state.spkcache, state.spkcachePreds,
+                            state.fifo, state.fifoPreds,
+                            state.meanSilEmb, state.nSilFrames
+                        )
+
+                        // 9. Advance and drop consumed PCM, keeping only the next step's left halo
+                        //    (+ STFT margin) — never below the next window's rawStart.
+                        g0 += spec.newMelFrames
+                        acc.drop(beforeAbsolute: max(0, (g0 - haloLeftMel) * hop))
+
+                        if eof && spec.newMelFrames < stepMel { break } // final partial chunk done
+                    }
+
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+
+            // Stop the producer when the consumer terminates (break, cancel, dealloc).
+            continuation.onTermination = { _ in
+                task.cancel()
+            }
+        }
+    }
+
     // MARK: - State Management
 
     private static func updateStreamingState(
@@ -1015,16 +1313,30 @@ public class SortformerModel: Module {
         )
     }
 
-    private static func maybeCompressState(
+    static func maybeCompressState(
         _ state: StreamingState,
         spkcacheMax: Int,
         fifoMax: Int,
         modulesCfg: ModulesConfig
     ) -> StreamingState {
-        if state.fifoLen <= fifoMax {
-            return state
+        // Loop the pop/compress until the FIFO is within bound. A single chunk may emit
+        // more than `spkcacheUpdatePeriod` embedding frames; `compressOnce` pops at most one
+        // period (preserving AOSC per-period semantics), so capping requires repeated passes.
+        var s = state
+        while s.fifoLen > fifoMax {
+            let before = s.fifoLen
+            s = compressOnce(s, spkcacheMax: spkcacheMax, fifoMax: fifoMax, modulesCfg: modulesCfg)
+            if s.fifoLen >= before { break }  // safety: no progress
         }
+        return s
+    }
 
+    private static func compressOnce(
+        _ state: StreamingState,
+        spkcacheMax: Int,
+        fifoMax: Int,
+        modulesCfg: ModulesConfig
+    ) -> StreamingState {
         let useAosc = modulesCfg.useAosc
 
         var popLen = state.fifoLen - fifoMax
