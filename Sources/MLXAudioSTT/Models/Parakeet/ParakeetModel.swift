@@ -4,6 +4,9 @@ import MLXNN
 import MLXAudioCore
 import MLXLMCommon
 import HuggingFace
+#if canImport(CoreML)
+import CoreML
+#endif
 
 public final class ParakeetModel: Module, STTGenerationModel {
     public enum Variant: Sendable {
@@ -223,8 +226,17 @@ public final class ParakeetModel: Module, STTGenerationModel {
             let audioDuration = Double(totalSamples) / Double(sampleRate)
 
             let requestedChunk = Double(generationParameters.chunkDuration)
-            let chunkDuration = requestedChunk >= 1199 ? 5.0 : max(0.5, requestedChunk)
             let overlapDuration = 1.0
+            let minimumChunkDuration = overlapDuration * 2
+            guard requestedChunk >= minimumChunkDuration else {
+                continuation.finish(
+                    throwing: STTError.invalidInput(
+                        "Parakeet chunkDuration must be at least 2 seconds for the 1-second overlap"
+                    )
+                )
+                return
+            }
+            let chunkDuration = requestedChunk >= 1199 ? 5.0 : requestedChunk
 
             let chunkSamples = max(1, Int(chunkDuration * Double(sampleRate)))
             let overlapSamples = max(0, min(chunkSamples - 1, Int(overlapDuration * Double(sampleRate))))
@@ -342,11 +354,11 @@ public final class ParakeetModel: Module, STTGenerationModel {
     /// How to source the optional CoreML/ANE Conformer encoder (default `.off` = pure MLX).
     public enum ANEEncoder: Sendable {
         case off
-        case on                  // download `defaultANEEncoderRepo` (parakeet-tdt-0.6b-v3); other checkpoints: use `.repo`/`.package`
+        case on                  // Core ML chooses among all available compute units
+        case lowPower            // pin the default encoder to CPU + Neural Engine
         case repo(String)        // download a specific Hugging Face repo
         case package(URL)        // a local .mlpackage / .mlmodelc
     }
-
     public static let defaultANEEncoderRepo = "beshkenadze/parakeet-tdt-0.6b-v3-coreml-ane"
 
     /// Apply an `ANEEncoder` option. No-op for `.off` or when CoreML is unavailable.
@@ -355,6 +367,12 @@ public final class ParakeetModel: Module, STTGenerationModel {
         switch option {
         case .off: break
         case .on: try await enableCoreMLEncoder(repo: Self.defaultANEEncoderRepo, cache: cache)
+        case .lowPower:
+            try await enableCoreMLEncoder(
+                repo: Self.defaultANEEncoderRepo,
+                cache: cache,
+                computeUnits: .cpuAndNeuralEngine
+            )
         case .repo(let repo): try await enableCoreMLEncoder(repo: repo, cache: cache)
         case .package(let url): try enableCoreMLEncoder(modelURL: url)
         }
@@ -363,21 +381,31 @@ public final class ParakeetModel: Module, STTGenerationModel {
 
     #if canImport(CoreML)
     /// Route the Conformer encoder through CoreML/ANE; decoder and chunking stay in MLX.
-    public func enableCoreMLEncoder(modelURL: URL, fixedFrames: Int = 1000) throws {
+    public func enableCoreMLEncoder(
+        modelURL: URL,
+        fixedFrames: Int = 1000,
+        computeUnits: MLComputeUnits = .all
+    ) throws {
         coreMLEncoder = try ParakeetCoreMLEncoder(
             modelURL: modelURL,
             featIn: encoderConfig.featIn,
             fixedFrames: fixedFrames,
             subsamplingFactor: encoderConfig.subsamplingFactor,
-            dModel: encoderConfig.dModel
+            dModel: encoderConfig.dModel,
+            computeUnits: computeUnits
         )
         encoderExecutionImplementation = .coreML
     }
 
     /// Download a CoreML encoder `.mlpackage` from a Hugging Face repo, then route through it.
-    public func enableCoreMLEncoder(repo: String, cache: HubCache = .default) async throws {
+    /// Pass `.cpuAndNeuralEngine` to keep the Conformer encoder off the GPU.
+    public func enableCoreMLEncoder(
+        repo: String,
+        cache: HubCache = .default,
+        computeUnits: MLComputeUnits = .all
+    ) async throws {
         let url = try await Self.downloadANEEncoderPackage(repo: repo, cache: cache)
-        try enableCoreMLEncoder(modelURL: url)
+        try enableCoreMLEncoder(modelURL: url, computeUnits: computeUnits)
     }
 
     static func downloadANEEncoderPackage(repo: String, cache: HubCache = .default) async throws -> URL {
@@ -966,16 +994,16 @@ public final class ParakeetModel: Module, STTGenerationModel {
         return (hidden: zeros, cell: zeros)
     }
 
-    private func decodeChunk(_ chunkAudio: MLXArray) -> ParakeetAlignedResult {
+    func decodeChunk(_ chunkAudio: MLXArray) -> ParakeetAlignedResult {
         let mel = ParakeetAudio.logMelSpectrogram(chunkAudio, config: preprocessConfig)
         return decode(mel: mel)[0]
     }
 
-    private func flattenTokens(from result: ParakeetAlignedResult) -> [ParakeetAlignedToken] {
+    func flattenTokens(from result: ParakeetAlignedResult) -> [ParakeetAlignedToken] {
         result.sentences.flatMap { $0.tokens }
     }
 
-    private func mergeTokenSequences(
+    func mergeTokenSequences(
         existing: [ParakeetAlignedToken],
         incoming: [ParakeetAlignedToken],
         overlapDuration: Double
