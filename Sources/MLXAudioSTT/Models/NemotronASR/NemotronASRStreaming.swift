@@ -161,11 +161,13 @@ extension NemotronASRModel {
 }
 
 #if canImport(CoreML)
-extension NemotronASRModel {
+public extension NemotronASRModel {
     /// Cache-aware streaming via the CoreML/ANE encoder, using the validated **uniform-F**
     /// feeding (every chunk `[preFrames prev-mel ++ newFrames new-mel]`, stride `newFrames`).
-    /// Same `onChunk` contract as `cacheAwareStreamEncode`: post-prompt frames `[1, chunkLen, d]`.
-    /// The prompt MLP and RNN-T decode stay in MLX; only the conformer encoder runs on the ANE.
+    /// The callback receives post-prompt frames `[1, chunkLength, dModel]` for incremental decode.
+    ///
+    /// This call resets and exclusively owns `coreEncoder` for the duration of the supplied mel
+    /// buffer. The prompt MLP and RNN-T decode stay in MLX; only the conformer runs on the ANE.
     func cacheAwareStreamEncodeCoreML(
         _ mel: MLXArray,
         language: String?,

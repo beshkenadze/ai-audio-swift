@@ -18,6 +18,168 @@ struct ParakeetBatchParityTests {
         return try ParakeetModel.fromDirectory(fixtureDir)
     }
 
+    @Test("live stream session separates window size from update cadence")
+    func liveStreamSessionSeparatesWindowSizeFromUpdateCadence() throws {
+        let model = try makeTDTFixtureModel()
+        let session = try model.makeStreamSession(
+            configuration: ParakeetStreamingConfiguration(
+                windowDuration: 2,
+                updateInterval: 0.5,
+                confirmationDelay: 0.5,
+                overlapDuration: 1,
+                minimumAudioDuration: 0.5
+            )
+        )
+        let samples = makeChunkAudio(sampleCount: 48_000, frequency: 220).asArray(Float.self)
+
+        #expect(session.step(Array(samples[0..<4_000])) == nil)
+        #expect(session.step(Array(samples[4_000..<8_000])) != nil)
+        #expect(session.step(Array(samples[8_000..<48_000])) != nil)
+        #expect(session.bufferedSampleCount <= 32_000)
+    }
+
+    @Test("live stream session never rewrites its confirmed token prefix")
+    func liveStreamSessionKeepsConfirmedPrefixMonotonic() throws {
+        let model = try makeTDTFixtureModel()
+        let session = try model.makeStreamSession(
+            configuration: ParakeetStreamingConfiguration(
+                windowDuration: 2,
+                updateInterval: 0.5,
+                confirmationDelay: 0.5,
+                overlapDuration: 1,
+                minimumAudioDuration: 0.5
+            )
+        )
+        let samples = makeChunkAudio(sampleCount: 48_000, frequency: 220).asArray(Float.self)
+        var confirmedTokenIds: [Int] = []
+
+        for start in stride(from: 0, to: samples.count, by: 8_000) {
+            let end = min(start + 8_000, samples.count)
+            guard let update = session.step(Array(samples[start..<end])) else { continue }
+            let next = Array(update.tokens.prefix(update.confirmedTokenCount).map(\.id))
+            #expect(Array(next.prefix(confirmedTokenIds.count)) == confirmedTokenIds)
+            confirmedTokenIds = next
+        }
+        #expect(!confirmedTokenIds.isEmpty)
+
+        let final = session.finish()
+        #expect(final.isFinal)
+        #expect(final.confirmedTokenCount == final.tokens.count)
+        #expect(session.finish().text == final.text)
+    }
+
+    @Test("live stream output is independent of PCM callback size")
+    func liveStreamSessionIsIndependentOfPCMCallbackSize() throws {
+        let model = try makeTDTFixtureModel()
+        let configuration = ParakeetStreamingConfiguration(
+            windowDuration: 2,
+            updateInterval: 0.5,
+            confirmationDelay: 0.5,
+            overlapDuration: 1,
+            minimumAudioDuration: 0.5
+        )
+        let samples = makeChunkAudio(sampleCount: 48_000, frequency: 220).asArray(Float.self)
+
+        func transcribe(feedSampleCount: Int) throws -> ParakeetStreamUpdate {
+            let session = try model.makeStreamSession(configuration: configuration)
+            for start in stride(from: 0, to: samples.count, by: feedSampleCount) {
+                let end = min(start + feedSampleCount, samples.count)
+                _ = session.step(Array(samples[start..<end]))
+            }
+            return session.finish()
+        }
+
+        let smallCallbacks = try transcribe(feedSampleCount: 320)
+        let largeCallbacks = try transcribe(feedSampleCount: 19_200)
+        #expect(!smallCallbacks.tokens.isEmpty)
+        #expect(smallCallbacks.text == largeCallbacks.text)
+        #expect(smallCallbacks.tokens.map(\.id) == largeCallbacks.tokens.map(\.id))
+    }
+
+    @Test("live stream rejects cadence that leaves no overlap")
+    func liveStreamSessionRejectsNonOverlappingCadence() throws {
+        let model = try makeTDTFixtureModel()
+        let configuration = ParakeetStreamingConfiguration(
+            windowDuration: 2,
+            updateInterval: 1.5,
+            confirmationDelay: 0.5,
+            overlapDuration: 1,
+            minimumAudioDuration: 0.5
+        )
+        #expect(throws: STTError.self) {
+            _ = try model.makeStreamSession(configuration: configuration)
+        }
+    }
+
+    @Test("live stream absorbs sub-frame jitter without dropping a one-frame token")
+    func liveStreamSessionAbsorbsConfirmedBoundaryJitter() {
+        let confirmed = ParakeetAlignedToken(id: 1, text: " previous", start: 1.92, duration: 0.08)
+        let incoming = [
+            ParakeetAlignedToken(id: 3, text: " duplicate", start: 1.96, duration: 0.08),
+            ParakeetAlignedToken(id: 1, text: " repeated", start: 2, duration: 0.04),
+            ParakeetAlignedToken(id: 2, text: " new", start: 2, duration: 0.08),
+        ]
+
+        let remaining = ParakeetStreamSession.tokensAfterConfirmedBoundary(
+            incoming,
+            lastConfirmedToken: confirmed,
+            tolerance: 0.04
+        )
+
+        #expect(remaining.map(\.text) == [" repeated", " new"])
+    }
+
+    @Test("live stream drops preceding tokens at the confirmed boundary")
+    func liveStreamSessionDropsPrecedingBoundaryTokens() {
+        let confirmed = ParakeetAlignedToken(id: 1, text: " confirmed", start: 0.44, duration: 0.04)
+        let incoming = [
+            ParakeetAlignedToken(id: 4, text: " preceding", start: 0.40, duration: 0.04),
+            ParakeetAlignedToken(id: 2, text: " next", start: 0.48, duration: 0.08),
+        ]
+
+        let remaining = ParakeetStreamSession.tokensAfterConfirmedBoundary(
+            incoming,
+            lastConfirmedToken: confirmed,
+            tolerance: 0.04
+        )
+
+        #expect(remaining.map(\.text) == [" next"])
+    }
+
+    @Test("live stream rejects a window whose sample count overflows Int")
+    func liveStreamSessionRejectsOverflowingWindow() throws {
+        let model = try makeTDTFixtureModel()
+        let configuration = ParakeetStreamingConfiguration(
+            windowDuration: .greatestFiniteMagnitude,
+            updateInterval: 1,
+            confirmationDelay: 0,
+            overlapDuration: 1,
+            minimumAudioDuration: 0
+        )
+
+        #expect(throws: STTError.self) {
+            _ = try model.makeStreamSession(configuration: configuration)
+        }
+    }
+
+    @Test("pseudo-streaming rejects a pathologically small chunk step")
+    func pseudoStreamingRejectsPathologicallySmallStep() async throws {
+        let model = try makeTDTFixtureModel()
+        let audio = makeChunkAudio(sampleCount: 16_000, frequency: 220)
+        var rejected = false
+
+        do {
+            for try await _ in model.generateStream(
+                audio: audio,
+                generationParameters: STTGenerateParameters(chunkDuration: 1.01)
+            ) {}
+        } catch STTError.invalidInput {
+            rejected = true
+        }
+
+        #expect(rejected)
+    }
+
     @Test("generateBatch preserves order and text parity for chunk-sized audio")
     func generateBatchPreservesOrderAndTextParity() throws {
         let model = try makeFixtureModel()

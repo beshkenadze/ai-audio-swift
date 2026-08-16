@@ -2,6 +2,9 @@ import Foundation
 @preconcurrency import MLX
 import MLXAudioCore
 import MLXAudioSTT
+#if canImport(CoreML)
+import CoreML
+#endif
 
 enum AppError: Error, LocalizedError, CustomStringConvertible {
     case inputFileNotFound(String)
@@ -75,6 +78,8 @@ private struct Options {
     var frameThreshold = 25
     var stream = false
     var context: String? = nil
+    var streamWindowDuration: Double = 9.5
+    var streamUpdateInterval: Double = 1
     var prefillStepSize = 2048
     var genKwargsRaw: String? = nil
     var text = ""
@@ -129,6 +134,14 @@ private struct Options {
                 options.frameThreshold = value
             case "--stream":
                 options.stream = true
+            case "--stream-window":
+                guard let v = it.next() else { throw CLIError.missingValue(arg) }
+                guard let value = Double(v) else { throw CLIError.invalidValue(arg, v) }
+                options.streamWindowDuration = value
+            case "--stream-update-interval":
+                guard let v = it.next() else { throw CLIError.missingValue(arg) }
+                guard let value = Double(v) else { throw CLIError.invalidValue(arg, v) }
+                options.streamUpdateInterval = value
             case "--context":
                 guard let v = it.next() else { throw CLIError.missingValue(arg) }
                 options.context = v
@@ -243,6 +256,8 @@ private struct Options {
               --chunk-duration <float>      Chunk duration seconds. Default: 30.0
               --frame-threshold <int>       Accepted for compatibility (currently unused). Default: 25
               --stream                      Stream token output while generating
+              --stream-window <seconds>     Parakeet rolling context window. Default: 9.5
+              --stream-update-interval <s>  Parakeet transcript update cadence. Default: 1.0
               --context <text>              Accepted for compatibility (currently unused)
               --prefill-step-size <int>     Accepted for compatibility (currently unused). Default: 2048
               --gen-kwargs <json>           Additional kwargs JSON.
@@ -289,7 +304,10 @@ enum App {
                     try parakeet.enableCoreMLEncoder(modelURL: resolveURL(path: coremlPath))
                     if options.verbose { print("CoreML/ANE encoder enabled: \(coremlPath)") }
                 } else if options.ane {
-                    try await parakeet.enableCoreMLEncoder(repo: ParakeetModel.defaultANEEncoderRepo)
+                    try await parakeet.enableCoreMLEncoder(
+                        repo: ParakeetModel.defaultANEEncoderRepo,
+                        computeUnits: .cpuAndNeuralEngine
+                    )
                     if options.verbose { print("ANE encoder enabled: \(ParakeetModel.defaultANEEncoderRepo)") }
                 }
             } else if let nemotron = m as? NemotronASRModel {
@@ -354,7 +372,13 @@ enum App {
             )
 
             if options.stream {
-                output = try await runStreaming(model: sttModel, audio: audio, parameters: params)
+                output = try await runStreaming(
+                    model: sttModel,
+                    audio: audio,
+                    parameters: params,
+                    streamWindowDuration: options.streamWindowDuration,
+                    streamUpdateInterval: options.streamUpdateInterval
+                )
             } else {
                 output = sttModel.generate(audio: audio, generationParameters: params)
             }
@@ -407,23 +431,27 @@ enum App {
     private static func runStreaming(
         model: any STTGenerationModel,
         audio: MLXArray,
-        parameters: STTGenerateParameters
+        parameters: STTGenerateParameters,
+        streamWindowDuration: TimeInterval,
+        streamUpdateInterval: TimeInterval
     ) async throws -> STTOutput {
-        // Voxtral Realtime has a true online streaming session — feed audio as it
-        // arrives (480 ms chunks ~ the model's native transcription delay) instead of
-        // the whole-buffer `generateStream`.
         if let voxtral = model as? VoxtralRealtimeModel {
             return runVoxtralStreaming(model: voxtral, audio: audio, parameters: parameters)
         }
-        // Nemotron has a true online session — feed audio as it arrives instead of the
-        // whole-buffer generateStream. The chunked-feed logic lives in the model. The
-        // session needs NA (frozen) mel normalization; for per-utterance normalization
-        // fall through to the generic stream instead of aborting on its precondition.
         if let nemotron = model as? NemotronASRModel {
             let norm = nemotron.preprocessConfig.normalize.lowercased()
             if norm == "na" || norm == "none" {
                 return runNemotronStreaming(model: nemotron, audio: audio, parameters: parameters)
             }
+        }
+        if let parakeet = model as? ParakeetModel {
+            return try runParakeetStreaming(
+                model: parakeet,
+                audio: audio,
+                language: parameters.language,
+                windowDuration: streamWindowDuration,
+                updateInterval: streamUpdateInterval
+            )
         }
 
         var finalOutput: STTOutput?
@@ -453,6 +481,43 @@ enum App {
         }
 
         return STTOutput(text: streamedText.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    private static func runParakeetStreaming(
+        model: ParakeetModel,
+        audio: MLXArray,
+        language: String?,
+        windowDuration: TimeInterval,
+        updateInterval: TimeInterval
+    ) throws -> STTOutput {
+        let startTime = CFAbsoluteTimeGetCurrent()
+        let session = try model.makeStreamSession(
+            configuration: ParakeetStreamingConfiguration(
+                windowDuration: windowDuration,
+                updateInterval: updateInterval
+            )
+        )
+        let mono = audio.ndim > 1 ? audio.mean(axis: -1) : audio
+        let samples = mono.asType(.float32).asArray(Float.self)
+        let feedSampleCount = model.preprocessConfig.sampleRate / 25
+        var start = 0
+
+        while start < samples.count {
+            let end = min(start + feedSampleCount, samples.count)
+            if let update = session.step(Array(samples[start..<end])) {
+                print(update.text)
+            }
+            start = end
+        }
+
+        let final = session.finish()
+        return STTOutput(
+            text: final.text,
+            segments: final.segments,
+            language: language,
+            generationTokens: final.tokens.count,
+            totalTime: CFAbsoluteTimeGetCurrent() - startTime
+        )
     }
 
     /// Drive Voxtral's streaming transcription from a file, printing each delta live.
