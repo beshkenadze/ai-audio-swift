@@ -17,10 +17,12 @@
 
 import Testing
 import MLX
+import MLXNN
 import Metal
 import MLXLMCommon
 import Tokenizers
 import Foundation
+import HuggingFace
 
 private let metalAvailable: Bool = {
     #if canImport(Metal)
@@ -699,6 +701,8 @@ private func collectQwen3TTSStream(
             infoCount += 1
         case .audio(let audio):
             lastAudio = audio
+        case .progress:
+            break
         }
     }
 
@@ -1401,6 +1405,68 @@ struct FishSpeechTests {
         #expect(batches == ["<|speaker:0|>hello\n<|speaker:1|>world", "<|speaker:2|>again"])
     }
 
+    @Test func testPlainTextBatchingHonorsByteLimit() {
+        let text = "  one  two\nthree 四五六七 eight  "
+        let batches = fishSpeechSplitTextIntoBatches(text, maxBytes: 10)
+
+        #expect(batches.joined() == text)
+        #expect(batches.allSatisfy { $0.lengthOfBytes(using: .utf8) <= 10 })
+    }
+
+    @Test func testPlainTextBatchingPreservesGraphemesAndSkipsWhitespaceOnlyBatches() {
+        let decomposedE = "e\u{301}"
+        let text = " " + String(repeating: "a", count: 38) + decomposedE + " tail"
+        let batches = fishSpeechSplitTextIntoBatches(text, maxBytes: 40)
+
+        #expect(batches.joined() == text)
+        #expect(batches.allSatisfy { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
+        #expect(batches.contains(where: { $0.contains(decomposedE) }))
+        #expect(!batches.contains(where: { $0 == "e" || $0 == "\u{301}" }))
+    }
+
+    @Test func testPlainTextBatchingBoundsOversizedGrapheme() {
+        let text = "e" + String(repeating: "\u{301}", count: 50)
+        let batches = fishSpeechSplitTextIntoBatches(text, maxBytes: 40)
+
+        #expect(batches.joined() == text)
+        #expect(batches.allSatisfy { $0.lengthOfBytes(using: .utf8) <= 40 })
+    }
+
+    @Test func testGenerationBatchesSplitLongSpeakerTurnsWithMarker() {
+        let marker = "<|speaker:0|>"
+        let payload = Array(repeating: "word", count: 30).joined(separator: " ")
+        let batches = fishSpeechGenerationBatches(marker + payload, maxBytes: 40)
+
+        #expect(batches.count > 1)
+        #expect(batches.allSatisfy { $0.hasPrefix(marker) })
+        #expect(batches.allSatisfy { $0.lengthOfBytes(using: .utf8) <= 40 })
+        #expect(batches.map { String($0.dropFirst(marker.count)) }.joined() == payload)
+    }
+
+    @Test func testGenerationBatchesDropWhitespaceOnlySlices() {
+        let text = String(repeating: " ", count: 41) + "speak this"
+        let batches = fishSpeechGenerationBatches(text, maxBytes: 40)
+
+        #expect(batches.allSatisfy {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        })
+        #expect(batches.joined().trimmingCharacters(in: .whitespacesAndNewlines) == "speak this")
+    }
+
+    @Test func testStreamingChunkBytesRejectsInvalidIntervals() throws {
+        #expect(try fishSpeechStreamingChunkBytes(interval: 2) == 80)
+        #expect(try fishSpeechStreamingChunkBytes(interval: 1_000) == 2_400)
+        #expect(throws: AudioGenerationError.self) {
+            try fishSpeechStreamingChunkBytes(interval: .infinity)
+        }
+        #expect(throws: AudioGenerationError.self) {
+            try fishSpeechStreamingChunkBytes(interval: .nan)
+        }
+        #expect(throws: AudioGenerationError.self) {
+            try fishSpeechStreamingChunkBytes(interval: 0)
+        }
+    }
+
     @Test func testSanitizeRemapsFishWeightPrefixes() {
         let model = FishSpeechModel(config: makeTinyFishSpeechConfig())
         let sanitized = model.sanitize(weights: [
@@ -1775,6 +1841,177 @@ struct KittenTTSTests {
         #expect(resolved == "kitten_tts")
         let resolved2 = TTS.resolveModelType(modelRepo: "mlx-community/kitten-tts-mini-0.8")
         #expect(resolved2 == "kitten_tts")
+    }
+}
+
+@Suite("BreezeTTS")
+struct BreezeTTSTests {
+    @Test func configKeepsWrapperAudioValuesSeparateFromBackboneValues() throws {
+        let json = """
+        {
+          "model_type": "breeze",
+          "audio_num_codebooks": 16,
+          "audio_vocab_size": 2051,
+          "audio_embed_size": 2048,
+          "text_vocab_size": 262158,
+          "audio_token_id": 262144,
+          "audio_eos_token_id": 262145,
+          "codec_config": {
+            "sampling_rate": 24000,
+            "codebook_size": 2048
+          },
+          "backbone_config": {
+            "model_type": "qwen3",
+            "vocab_size": 151936,
+            "hidden_size": 2048,
+            "intermediate_size": 6144,
+            "num_hidden_layers": 28,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "rms_norm_eps": 0.00001,
+            "max_position_embeddings": 40960,
+            "rope_theta": 500000
+          },
+          "depth_decoder_config": {
+            "vocab_size": 2051,
+            "num_codebooks": 16,
+            "hidden_size": 1024,
+            "num_hidden_layers": 12,
+            "intermediate_size": 8192,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 2,
+            "head_dim": 128
+          },
+          "text_encoder_config": {
+            "vocab_size": 262158,
+            "hidden_size": 1152,
+            "intermediate_size": 6912,
+            "num_hidden_layers": 26,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 4,
+            "head_dim": 256,
+            "rms_norm_eps": 0.000001,
+            "eoi_token_index": 262145,
+            "sliding_window": 512,
+            "layer_types": ["full_attention"]
+          }
+        }
+        """
+
+        let config = try JSONDecoder().decode(BreezeTTSConfig.self, from: Data(json.utf8))
+
+        #expect(config.modelType == "breeze")
+        #expect(config.numCodebooks == 16)
+        #expect(config.audioVocabSize == 2051)
+        #expect(config.codecVocabSize == 2048)
+        #expect(config.sampleRate == 24_000)
+        #expect(config.backboneConfig.vocabSize == 151_936)
+        #expect(config.backboneConfig.hiddenSize == 2_048)
+        #expect(config.depthDecoderConfig.hiddenSize == 1_024)
+        #expect(config.textEncoderConfig.hiddenSize == 1_152)
+        #expect(config.textEncoderConfig.layerTypes == ["full_attention"])
+    }
+
+    @Test func factoryInfersBreezeModelType() {
+        #expect(TTS.resolveModelType(modelRepo: "mlx-community/Breeze-TTS-2-mlx-4bit") == "breeze")
+        #expect(TTS.resolveModelType(modelRepo: "anything", modelType: "breeze_tts") == "breeze_tts")
+    }
+
+    @Test func textEncoderKeepsSequenceShape() throws {
+        let config = try JSONDecoder().decode(BreezeTextEncoderConfig.self, from: Data("""
+        {
+          "vocab_size": 32,
+          "hidden_size": 16,
+          "intermediate_size": 32,
+          "num_hidden_layers": 2,
+          "num_attention_heads": 2,
+          "num_key_value_heads": 1,
+          "head_dim": 8,
+          "eoi_token_index": 31,
+          "sliding_window": 4,
+          "layer_types": ["sliding_attention", "full_attention"]
+        }
+        """.utf8))
+        let encoder = BreezeTTSTextEncoder(config: config)
+        let output = encoder(MLXArray([1, 2, 31, 3]).reshaped([1, 4]))
+        eval(output)
+        #expect(output.shape == [1, 4, 16])
+    }
+
+    @Test func slidingTextMaskRestrictsDistantKeys() {
+        let mask = breezeTextAttentionMask(length: 5, layerType: "sliding_attention", slidingWindow: 3)!
+        let values = mask.asArray(Bool.self)
+        #expect(mask.shape == [1, 1, 5, 5])
+        #expect(mask.dtype == .bool)
+        #expect(values[0])
+        #expect(!values[4])
+    }
+
+    @Test func audioEmbeddingSumsAllCodebooks() {
+        let embedding = BreezeAudioEmbedding(
+            numCodebooks: 3,
+            vocabSize: 8,
+            audioEmbedSize: 4,
+            hiddenSize: 4
+        )
+        let output = embedding(MLXArray([1, 2, 3]).reshaped([1, 1, 3]))
+        eval(output)
+        #expect(output.shape == [1, 1, 4])
+    }
+
+    @Test func depthDecoderSelectsOneHeadPerCodebook() throws {
+        let config = try JSONDecoder().decode(BreezeDepthDecoderConfig.self, from: Data("""
+        {
+          "vocab_size": 8,
+          "num_codebooks": 3,
+          "audio_embed_size": 4,
+          "backbone_hidden_size": 4,
+          "hidden_size": 4,
+          "num_hidden_layers": 1,
+          "intermediate_size": 8,
+          "num_attention_heads": 1,
+          "num_key_value_heads": 1,
+          "head_dim": 4
+        }
+        """.utf8))
+        let decoder = BreezeDepthDecoder(config: config)
+        let first = decoder.nextLogits(
+            tokenIDs: MLXArray([0, 1]).reshaped([1, 2]),
+            backboneHiddenState: MLXArray.zeros([1, 4])
+        )
+        let second = decoder.nextLogits(
+            tokenIDs: MLXArray([0, 1, 2]).reshaped([1, 3]),
+            backboneHiddenState: MLXArray.zeros([1, 4])
+        )
+        eval(first, second)
+        #expect(first.shape == [1, 8])
+        #expect(second.shape == [1, 8])
+    }
+
+    @Test func promptUsesVoiceAsInstruction() {
+        #expect(BreezeTTSModel.promptText(text: "Hello", instruction: nil) == "[S0]Hello")
+        #expect(
+            BreezeTTSModel.promptText(text: "Hello", instruction: "Warm and calm")
+                == "[S0]<ins_bos>Warm and calm<ins_eos>Hello"
+        )
+    }
+
+    @Test func sanitizeSeparatesMainModelFromCodecWeights() {
+        let depth = MLXArray.ones([2, 2])
+        let stale = MLXArray.zeros([2, 2])
+        let sanitized = BreezeTTSModel.sanitize(weights: [
+            "depth_decoder.model.embed_tokens.weight": depth,
+            "backbone_model.embed_tokens.embed_audio_tokens.weight": stale,
+            "codec_model.decoder.weight": MLXArray.ones([1]),
+            "backbone_model.rotary_emb.inv_freq": MLXArray.ones([1]),
+        ])
+        #expect(sanitized["codec_model.decoder.weight"] == nil)
+        #expect(sanitized["backbone_model.rotary_emb.inv_freq"] == nil)
+        #expect(
+            sanitized["backbone_model.embed_tokens.embed_audio_tokens.weight"]?.shape
+                == depth.shape
+        )
     }
 }
 
@@ -2329,5 +2566,441 @@ struct KokoroMultilingualProcessorTests {
         try await processor.prepare(for: "en-us")
         try await processor.prepare(for: "en-gb")
         try await processor.prepare(for: "en")
+    }
+}
+
+private func makeTinyIndexTTSWeights(config: IndexTTSConfig) -> [String: MLXArray] {
+    let core = IndexTTSCore(config: config)
+    return Dictionary(uniqueKeysWithValues: core.parameters().flattened().map { key, value in
+        (key, MLXArray.zeros(value.shape))
+    })
+}
+
+private func makeTinyIndexTTSTokenizer() throws -> SentencePieceTokenizer {
+    let json = """
+    {
+      "model": {
+        "type": "BPE",
+        "unk_id": 0,
+        "vocab": [
+          ["<unk>", 0.0],
+          ["▁", -100.0],
+          ["A", -100.0],
+          ["▁A", -1.0]
+        ]
+      }
+    }
+    """
+    return try SentencePieceTokenizer(tokenizerJSONData: Data(json.utf8))
+}
+
+private func makeTinyIndexTTSVocoder(config: IndexTTSConfig) -> IndexTTSBigVGANConditioning {
+    let speakerConfig = MLXAudioCodecs.EcapaTdnnConfig(
+        inputSize: config.bigvgan.numMels,
+        channels: 8,
+        embedDim: config.bigvgan.speakerEmbeddingDim,
+        attentionChannels: 4,
+        res2netScale: 8,
+        seChannels: 4,
+        globalContext: true,
+        reflectPadding: true
+    )
+    let vocoder = IndexTTSBigVGANConditioning(config: config.bigvgan, speakerEncoderConfig: speakerConfig)
+    vocoder.train(false)
+    return vocoder
+}
+
+// MARK: - IndexTTS Tests
+
+@Suite("IndexTTS Tests")
+struct IndexTTSTests {
+    @Test func configDecodesPythonStyleJSON() throws {
+        let json = """
+        {
+          "model_type": "indextts",
+          "sample_rate": 24000,
+          "tokenizer_name": "IndexTeam/IndexTTS-1.5",
+          "bigvgan": {
+            "num_mels": 100,
+            "gpt_dim": 1024,
+            "speaker_embedding_dim": 192,
+            "cond_d_vector_in_each_upsampling_layer": true
+          },
+          "gpt": {
+            "model_dim": 8,
+            "heads": 2,
+            "layers": 1,
+            "max_mel_tokens": 8,
+            "max_text_tokens": 8,
+            "number_text_tokens": 16,
+            "number_mel_codes": 8,
+            "start_mel_token": 6,
+            "stop_mel_token": 7,
+            "start_text_token": 14,
+            "stop_text_token": 15,
+            "use_mel_codes_as_input": true,
+            "mel_length_compression": 2,
+            "condition_type": "conformer_perceiver",
+            "max_conditioning_inputs": 1,
+            "condition_num_latent": 2,
+            "condition_module": {
+              "input_size": 4,
+              "output_size": 8,
+              "num_blocks": 1,
+              "linear_units": 16,
+              "attention_heads": 2,
+              "perceiver_mult": 2
+            }
+          }
+        }
+        """
+        let config = try JSONDecoder().decode(IndexTTSConfig.self, from: Data(json.utf8))
+        #expect(config.modelType == "indextts")
+        #expect(config.bigvgan.gptDim == 1024)
+        #expect(config.gpt.conditionModule.outputSize == 8)
+        #expect(config.gpt.conditionNumLatent == 2)
+    }
+
+    @Test func resolvesTokenizerModelFromHuggingFaceSnapshotCache() throws {
+        let modelDir = try makeTemporaryArtifactDirectory(prefix: "indextts-model")
+        defer { cleanupTemporaryArtifactDirectory(modelDir) }
+        let cacheDir = try makeTemporaryArtifactDirectory(prefix: "indextts-cache")
+        defer { cleanupTemporaryArtifactDirectory(cacheDir) }
+
+        let cache = HubCache(cacheDirectory: cacheDir)
+        let repoID = try #require(Repo.ID(rawValue: "mlx-community/IndexTTS"))
+        let repoDir = cache.repoDirectory(repo: repoID, kind: .model)
+        let revision = "abc123"
+        let snapshotDir = repoDir.appendingPathComponent("snapshots").appendingPathComponent(revision)
+        let refsDir = repoDir.appendingPathComponent("refs")
+        try FileManager.default.createDirectory(at: snapshotDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: refsDir, withIntermediateDirectories: true)
+
+        let tokenizerURL = snapshotDir.appendingPathComponent("tokenizer.model")
+        try Data([0x49, 0x54, 0x53]).write(to: tokenizerURL)
+        try writeTestFile(refsDir.appendingPathComponent("main"), contents: revision)
+
+        let resolved = try #require(IndexTTSModel.resolveTokenizerModelURL(
+            from: modelDir,
+            tokenizerName: "mlx-community/IndexTTS",
+            cache: cache
+        ))
+        #expect(resolved.standardizedFileURL.path == tokenizerURL.standardizedFileURL.path)
+    }
+
+    @Test func fromPretrainedDownloadsRootTokenizerModelSidecar() {
+        #expect(IndexTTSModel.additionalDownloadPatterns.contains("*.model"))
+    }
+
+    @Test func defaultSamplingParametersMatchPythonForIndexTTS() {
+        let model = IndexTTSModel(config: .tinyForTests())
+        #expect(model.defaultGenerationParameters.temperature == 0.8)
+        #expect(model.defaultGenerationParameters.topK == 30)
+        #expect(model.defaultGenerationParameters.topP == 1.0)
+    }
+
+    @Test func normalizerTokenizesCJKAndUppercasesASCII() {
+        let cases = [
+            (
+                "hello  世界",
+                "hello  世界",
+                "HELLO 世 界"
+            ),
+            (
+                "What's this? It's $12,345.",
+                "What is this? It is twelve thousand three hundred forty five dollars",
+                "WHAT IS THIS? IT IS TWELVE THOUSAND THREE HUNDRED FORTY FIVE DOLLARS"
+            ),
+            (
+                "call 1 2 3 now",
+                "call one two three now",
+                "CALL ONE TWO THREE NOW"
+            ),
+            (
+                "hello: world; ok",
+                "hello, world, ok",
+                "HELLO, WORLD, OK"
+            ),
+            (
+                "你好：世界！",
+                "你好,世界!",
+                "你 好 , 世 界 !"
+            ),
+            (
+                "ju4 xue2",
+                "JV4 XVE2",
+                "JV4 XVE2"
+            ),
+            (
+                "1,234 bottles",
+                "one thousand two hundred thirty four bottles",
+                "ONE THOUSAND TWO HUNDRED THIRTY FOUR BOTTLES"
+            ),
+            (
+                "hello...world",
+                "hello…world",
+                "HELLO…WORLD"
+            ),
+        ]
+
+        for (input, expectedNormalized, expectedTokenized) in cases {
+            let normalized = IndexTTSTextNormalizer.normalize(input)
+            #expect(normalized == expectedNormalized)
+            #expect(IndexTTSTextNormalizer.tokenizeByCJKChar(normalized) == expectedTokenized)
+        }
+    }
+
+    @Test func referenceAudioMelFeaturesFeedConditioningPath() throws {
+        let config = IndexTTSConfig.tinyForTests()
+        let model = IndexTTSModel(config: config)
+        let mono = MLXArray((0..<512).map { i in
+            Float(sin(Double(i) * 2.0 * Double.pi / 64.0))
+        })
+        let stereo = MLX.concatenated([
+            mono.expandedDimensions(axis: 1),
+            (mono * MLXArray(0.5)).expandedDimensions(axis: 1),
+        ], axis: 1)
+
+        let features = try model.referenceFeatures(
+            from: stereo,
+            sampleRate: config.sampleRate,
+            nFft: 64,
+            hopLength: 16
+        )
+        eval(features)
+        #expect(features.shape[0] == 1)
+        #expect(features.shape[1] > 0)
+        #expect(features.shape[2] == config.gpt.conditionModule.inputSize)
+        #expect(features[0, 0, 0].item(Float.self).isFinite)
+
+        let prepared = try model.core.prepareInputEmbedding(textTokenIDs: [1], referenceFeatures: features)
+        eval(prepared.embeddings)
+        #expect(prepared.conditioningTokenCount == config.gpt.conditionNumLatent)
+    }
+
+    @Test func sanitizerDropsUnsupportedPiecesAndRemapsRawPerceiver() {
+        let sanitized = IndexTTSModel.sanitize(weights: [
+            "num_batches_tracked": MLXArray.zeros([1]),
+            "conditioning_encoder.embed.conv.0.weight": MLXArray.ones([2, 3, 4]),
+            "conditioning_encoder.embed.conv.2.weight": MLXArray.ones([2, 3, 4, 1]),
+            "conv_pre.weight": MLXArray.ones([2, 3, 4]),
+            "gpt.h.0.attn.c_attn.weight": MLXArray.ones([8, 24]),
+            "perceiver_encoder.layers.0.0.to_kv.weight": MLXArray.ones([16, 8]),
+            "perceiver_encoder.layers.0.1.0.bias": MLXArray.ones([32]),
+            "perceiver_encoder.norm.gamma": MLXArray.ones([8]),
+        ])
+
+        #expect(sanitized["conditioning_encoder.embed.conv.0.weight"]?.shape == [2, 4, 3])
+        #expect(sanitized["conditioning_encoder.embed.conv.1.weight"]?.shape == [2, 4, 1, 3])
+        #expect(sanitized["conv_pre.weight"] == nil)
+        #expect(sanitized["gpt.h.0.attn.c_attn.weight"]?.shape == [24, 8])
+        #expect(sanitized["perceiver_encoder.layers.0.attention.linear_k.weight"]?.shape == [8, 8])
+        #expect(sanitized["perceiver_encoder.layers.0.attention.linear_v.weight"]?.shape == [8, 8])
+        #expect(sanitized["perceiver_encoder.layers.0.feed_forward.w_1.bias"]?.shape == [32])
+        #expect(sanitized["perceiver_encoder.norm.weight"]?.shape == [8])
+
+        let converted = IndexTTSModel.sanitize(weights: [
+            "perceiver_encoder.layers.0.0.linear_q.weight": MLXArray.ones([8, 16]),
+            "perceiver_encoder.layers.0.0.linear_k.weight": MLXArray.ones([8, 16]),
+            "perceiver_encoder.layers.0.0.linear_v.weight": MLXArray.ones([8, 16]),
+            "perceiver_encoder.layers.0.0.linear_out.weight": MLXArray.ones([16, 8]),
+            "perceiver_encoder.layers.0.1.w_1.bias": MLXArray.ones([32]),
+            "perceiver_encoder.layers.0.1.w_2.weight": MLXArray.ones([16, 16]),
+        ])
+        #expect(converted["perceiver_encoder.layers.0.attention.linear_q.weight"]?.shape == [8, 16])
+        #expect(converted["perceiver_encoder.layers.0.attention.linear_k.weight"]?.shape == [8, 16])
+        #expect(converted["perceiver_encoder.layers.0.attention.linear_v.weight"]?.shape == [8, 16])
+        #expect(converted["perceiver_encoder.layers.0.attention.linear_out.weight"]?.shape == [16, 8])
+        #expect(converted["perceiver_encoder.layers.0.feed_forward.w_1.bias"]?.shape == [32])
+        #expect(converted["perceiver_encoder.layers.0.feed_forward.w_2.weight"]?.shape == [16, 16])
+    }
+
+    @Test func corePreparesPromptEmbeddingsAndLogits() throws {
+        let config = IndexTTSConfig.tinyForTests()
+        let core = IndexTTSCore(config: config)
+        let referenceFeatures = MLXArray.zeros([1, 3, config.gpt.conditionModule.inputSize])
+        let prepared = try core.prepareInputEmbedding(textTokenIDs: [1, 2], referenceFeatures: referenceFeatures)
+        let expectedTextTokens = 5
+
+        #expect(prepared.conditioningTokenCount == config.gpt.conditionNumLatent)
+        #expect(prepared.textTokenCount == expectedTextTokens)
+        #expect(prepared.embeddings.shape == [1, config.gpt.conditionNumLatent + expectedTextTokens, config.gpt.modelDim])
+
+        let logits = core.logits(inputEmbeddings: prepared.embeddings)
+        eval(logits)
+        #expect(logits.shape == [1, config.gpt.conditionNumLatent + expectedTextTokens, config.gpt.numberMelCodes])
+    }
+
+    @Test func conformerConditioningFeedsPerceiverLatents() throws {
+        let config = IndexTTSConfig.tinyForTests()
+        let core = IndexTTSCore(config: config)
+        let referenceFeatures = MLXArray.zeros([1, 3, config.gpt.conditionModule.inputSize])
+        let conditioning = try core.getConditioning(referenceFeatures: referenceFeatures)
+        eval(conditioning)
+        #expect(conditioning.shape == [1, config.gpt.conditionNumLatent, config.gpt.modelDim])
+    }
+
+    @Test func tinyGreedyMelGenerationProducesTokenIDs() throws {
+        let config = IndexTTSConfig.tinyForTests()
+        let core = IndexTTSCore(config: config)
+        try core.update(
+            parameters: ModuleParameters.unflattened(makeTinyIndexTTSWeights(config: config)),
+            verify: .all
+        )
+        let conditioning = MLXArray.zeros([1, config.gpt.conditionNumLatent, config.gpt.modelDim])
+        let generated = try core.generateMelTokens(textTokenIDs: [1], conditioningLatents: conditioning, maxTokens: 3)
+        #expect(generated.tokenIDs == [0, 0, 0])
+        #expect(generated.latentStates.shape == [1, 3, config.gpt.modelDim])
+    }
+
+    @Test func bigVGANConditioningUsesPrecomputedSpeakerEmbedding() throws {
+        let config = IndexTTSConfig.tinyForTests()
+        let vocoder = makeTinyIndexTTSVocoder(config: config)
+        let latentStates = MLXArray.zeros([1, 3, config.bigvgan.gptDim])
+        let speakerEmbedding = MLXArray.zeros([1, config.bigvgan.speakerEmbeddingDim])
+        let waveform = try vocoder(latentStates: latentStates, speakerEmbedding: speakerEmbedding)
+        eval(waveform)
+        #expect(waveform.shape == [1, 1, 3 * config.bigvgan.upsampleRates.reduce(1, *)])
+
+        let referenceFeatures = MLXArray.zeros([1, 12, config.bigvgan.numMels])
+        let extractedSpeaker = try vocoder.speakerEmbedding(referenceFeatures: referenceFeatures)
+        eval(extractedSpeaker)
+        #expect(extractedSpeaker.shape == [1, config.bigvgan.speakerEmbeddingDim])
+
+        let waveformFromReference = try vocoder(
+            latentStates: latentStates,
+            referenceFeatures: referenceFeatures.transposed(0, 2, 1)
+        )
+        eval(waveformFromReference)
+        #expect(waveformFromReference.shape == waveform.shape)
+
+        let model = IndexTTSModel(config: config, vocoder: vocoder)
+        let decoded = try model.decodeWaveform(latentStates: latentStates, speakerEmbedding: speakerEmbedding)
+        eval(decoded)
+        #expect(decoded.shape == waveform.shape)
+        let decodedFromReference = try model.decodeWaveform(latentStates: latentStates, referenceFeatures: referenceFeatures)
+        eval(decodedFromReference)
+        #expect(decodedFromReference.shape == waveform.shape)
+
+        let sanitized = vocoder.sanitize(weights: [
+            "bigvgan.cond_layer.weight": MLXArray.ones([
+                config.bigvgan.upsampleInitialChannel,
+                config.bigvgan.speakerEmbeddingDim,
+                1,
+            ]),
+            "bigvgan.speaker_encoder.blocks.0.conv.conv.weight": MLXArray.ones([
+                8,
+                config.bigvgan.numMels,
+                5,
+            ]),
+            "bigvgan.ups.0.0.weight_g": MLXArray.ones([
+                1,
+                1,
+                config.bigvgan.upsampleInitialChannel,
+            ]),
+            "bigvgan.ups.0.0.weight_v": MLXArray.ones([
+                config.bigvgan.upsampleInitialChannel / 2,
+                config.bigvgan.upsampleKernelSizes[0],
+                config.bigvgan.upsampleInitialChannel,
+            ]),
+            "bigvgan.ups.0.0.bias": MLXArray.ones([
+                config.bigvgan.upsampleInitialChannel / 2,
+            ]),
+        ])
+        #expect(sanitized["cond_layer.weight"]?.shape == [
+            config.bigvgan.upsampleInitialChannel,
+            1,
+            config.bigvgan.speakerEmbeddingDim,
+        ])
+        #expect(sanitized["speaker_encoder.block0.conv.weight"]?.shape == [
+            8,
+            5,
+            config.bigvgan.numMels,
+        ])
+        #expect(sanitized["ups.0.conv.weight_g"]?.shape == [
+            1,
+            1,
+            config.bigvgan.upsampleInitialChannel,
+        ])
+        #expect(sanitized["ups.0.conv.weight_v"]?.shape == [
+            config.bigvgan.upsampleInitialChannel / 2,
+            config.bigvgan.upsampleKernelSizes[0],
+            config.bigvgan.upsampleInitialChannel,
+        ])
+        #expect(sanitized["ups.0.conv.bias"]?.shape == [
+            config.bigvgan.upsampleInitialChannel / 2,
+        ])
+    }
+
+    @Test func generateWaveformChainsConditioningMelGenerationAndVocoder() async throws {
+        let config = IndexTTSConfig.tinyForTests()
+        let core = IndexTTSCore(config: config)
+        try core.update(
+            parameters: ModuleParameters.unflattened(makeTinyIndexTTSWeights(config: config)),
+            verify: .all
+        )
+        let model = IndexTTSModel(
+            config: config,
+            core: core,
+            vocoder: makeTinyIndexTTSVocoder(config: config),
+            tokenizer: try makeTinyIndexTTSTokenizer()
+        )
+
+        let referenceFeatures = MLXArray.zeros([1, 12, config.bigvgan.numMels])
+        let waveform = try model.generateWaveform(
+            textTokenIDs: [1],
+            referenceFeatures: referenceFeatures,
+            maxTokens: 3
+        )
+        eval(waveform)
+        #expect(waveform.shape == [1, 1, 3 * config.bigvgan.upsampleRates.reduce(1, *)])
+
+        let referenceAudio = MLXArray((0..<2048).map { i in
+            Float(sin(Double(i) * 2.0 * Double.pi / 64.0))
+        })
+        let generated = try await model.generate(
+            text: "a",
+            voice: nil,
+            refAudio: referenceAudio,
+            refText: nil,
+            language: nil,
+            generationParameters: GenerateParameters(maxTokens: 2, temperature: 0)
+        )
+        eval(generated)
+        #expect(generated.shape == [1, 1, 2 * config.bigvgan.upsampleRates.reduce(1, *)])
+
+        let stream = model.generateStream(
+            text: "a",
+            voice: nil,
+            refAudio: referenceAudio,
+            refText: nil,
+            language: nil,
+            generationParameters: GenerateParameters(maxTokens: 2),
+            streamingInterval: 0.00025
+        )
+        var streamChunks: [MLXArray] = []
+        for try await event in stream {
+            if case .audio(let chunk) = event {
+                streamChunks.append(chunk)
+            }
+        }
+        #expect(streamChunks.count == 1)
+    }
+
+    @Test func ttsFactoryLoadsLocalIndexTTSFixture() async throws {
+        let config = IndexTTSConfig.tinyForTests()
+        let weights = makeTinyIndexTTSWeights(config: config)
+
+        let fixtureDir = try makeTemporaryArtifactDirectory(prefix: "indextts-fixture")
+        defer { cleanupTemporaryArtifactDirectory(fixtureDir) }
+        try JSONEncoder().encode(config).write(to: fixtureDir.appendingPathComponent("config.json"))
+        try MLX.save(arrays: weights, url: fixtureDir.appendingPathComponent("model.safetensors"))
+
+        let loaded = try await TTS.loadModel(modelRepo: fixtureDir.path, modelType: "indextts")
+        let indexTTS = try #require(loaded as? IndexTTSModel)
+        #expect(indexTTS.sampleRate == config.sampleRate)
+        #expect(indexTTS.config.gpt.modelDim == config.gpt.modelDim)
+        #expect(indexTTS.core.training == false)
+        #expect(indexTTS.vocoder == nil)
     }
 }

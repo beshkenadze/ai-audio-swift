@@ -123,15 +123,21 @@ public final class KittenTTSModel: Module, SpeechGenerationModel, @unchecked Sen
                 return
             }
             do {
-                let audio = try await self.generate(
-                    text: text,
-                    voice: voice,
-                    refAudio: refAudio,
-                    refText: refText,
-                    language: language,
-                    generationParameters: generationParameters
-                )
-                continuation.yield(.audio(audio))
+                // Sentence-level chunks: first audio after one sentence, not
+                // the whole input.
+                let pieces = SentenceChunker.chunks(from: text, maxLength: 400)
+                for piece in pieces {
+                    try Task.checkCancellation()
+                    let audio = try await self.generate(
+                        text: piece,
+                        voice: voice,
+                        refAudio: refAudio,
+                        refText: refText,
+                        language: language,
+                        generationParameters: generationParameters
+                    )
+                    continuation.yield(.audio(audio))
+                }
                 continuation.finish()
             } catch {
                 continuation.finish(throwing: error)

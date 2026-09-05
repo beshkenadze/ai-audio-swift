@@ -100,6 +100,12 @@ public enum ModelUtils {
                         print("Cached config.json is invalid, clearing cache...")
                         Self.clearCaches(modelDir: modelDir, repoID: repoID, hubCache: cache)
                     }
+                } else {
+                    // Resource-only repos (e.g. G2P dictionaries) legitimately ship no
+                    // config.json. The required-extension file is present and non-empty,
+                    // which is this code's completeness heuristic, so treat as a cache hit.
+                    print("Using cached model at: \(modelDir.path)")
+                    return modelDir
                 }
             } else {
                 print("Cached model appears incomplete, clearing cache...")
