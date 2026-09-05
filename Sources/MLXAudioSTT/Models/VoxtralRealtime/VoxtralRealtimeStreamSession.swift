@@ -1,7 +1,6 @@
 import Foundation
 import MLX
 import MLXAudioCore
-import MLXNN
 
 // True incremental (online) streaming for Voxtral Realtime.
 //
@@ -12,10 +11,11 @@ import MLXNN
 // the model's native transcription delay — O(1) work per chunk.
 //
 // Correctness (WER 0 vs offline):
-//   * conv stem is causal and `prepareMel` right-pads with zeros, so `convOut[0..<k]`
-//     re-derived from a prefix is bit-identical to the offline full encode for every
-//     frozen row k. The only unfrozen row is the trailing partial token (chunk ended
-//     mid-1280-sample-token) — guarded by `frozenGuardTokens`.
+//   * the mel/conv front end runs incrementally with carried tails
+//     (`VoxtralRealtimeMelStream` + `convStemStep`): mel windows are emitted only
+//     once complete and both convs are causal, so every produced row is final and
+//     matches the offline full encode at the same absolute index. The trailing
+//     partial token is guarded by `frozenGuardTokens`.
 //   * RoPE attention is relative-position invariant, so feeding conv frames in
 //     sliding-window-aligned blocks with the cache RESET at each boundary reproduces
 //     `encodeChunked` (>sw) exactly; a single un-reset block reproduces `encodeFull`
@@ -43,36 +43,23 @@ extension VoxtralRealtimeAudioEncoder {
         upTo: Int,
         state: inout VoxtralRealtimeStreamEncoderState
     ) -> MLXArray {
-        feedIncremental(block: convOut[state.consumed..<upTo, 0...], state: &state)
-    }
-
-    /// Same, but takes just the new conv frames (row 0 == conv frame `state.consumed`),
-    /// so callers can produce them without materialising the whole prefix.
-    func feedIncremental(
-        block: MLXArray,
-        state: inout VoxtralRealtimeStreamEncoderState
-    ) -> MLXArray {
         let sw = config.slidingWindow
-        let upTo = state.consumed + block.shape[0]
         var pieces: [MLXArray] = []
-        var offset = 0
         while state.consumed < upTo {
             let blockEnd = state.blockBase + sw
             let end = min(upTo, blockEnd)
-            let n = end - state.consumed
-            let sub = block[offset..<(offset + n), 0...]
+            let block = convOut[state.consumed..<end, 0...]
             // Block-relative positions: RoPE is relative, so this matches the absolute
             // positions offline uses within each independent sw-block.
             let relStart = state.consumed - state.blockBase
-            pieces.append(encodeIncremental(sub, startPos: relStart, caches: &state.caches))
-            offset += n
+            pieces.append(encodeIncremental(block, startPos: relStart, caches: &state.caches))
             state.consumed = end
             if state.consumed == blockEnd {
                 state.caches = Array(repeating: nil, count: transformerLayers.count)
                 state.blockBase = blockEnd
             }
         }
-        if pieces.isEmpty { return block[0..<0, 0...] }
+        if pieces.isEmpty { return convOut[0..<0, 0...] }
         return pieces.count == 1 ? pieces[0] : MLX.concatenated(pieces, axis: 0)
     }
 }
@@ -92,7 +79,16 @@ public final class VoxtralRealtimeStreamSession {
     // Only the trailing partial token (chunk ended mid-1280-sample-token) is unfrozen.
     private let frozenGuardTokens = 1
 
-    private var realAudio: [Float] = []
+    // Incremental front-end state; all rows are final (see the header notes).
+    // `flushed` means `finish()` sealed the stream by appending the offline right-pad.
+    private var pendingSamples: [Float] = []
+    private var realSamplesFed = 0
+    private var melStream: VoxtralRealtimeMelStream?
+    private var convState = VoxtralRealtimeConvStemState()
+    private var convRows: MLXArray?
+    private var nDelayTokens = 0
+    private var flushed = false
+
     private var encState: VoxtralRealtimeStreamEncoderState
     private var adapterBuf: MLXArray?
     private var decCache: [VoxtralRealtimeDecoderKVCache?]?
@@ -104,14 +100,6 @@ public final class VoxtralRealtimeStreamSession {
 
     private var generated: [Int] = []
     private var emittedText = ""
-
-    private lazy var melFilters: MLXArray = model.ensureMelFilters()
-    private lazy var hannWindow: MLXArray = {
-        // Periodic Hann — must match `computeMelSpectrogram` bit-for-bit.
-        let win = model.config.audioEncodingArgs.windowSize
-        let n = MLXArray(0..<win).asType(.float32)
-        return 0.5 * (1.0 - cos((2.0 * Float.pi * n) / Float(win)))
-    }()
 
     public init(
         model: VoxtralRealtimeModel,
@@ -136,9 +124,10 @@ public final class VoxtralRealtimeStreamSession {
     public var isFinished: Bool { done }
 
     /// Ingest a chunk of 16 kHz mono samples; returns the text decoded by this call.
+    /// Calls after `finish()` are ignored (the stream is sealed by the final pad).
     @discardableResult
     public func step(_ samples: [Float]) -> Delta {
-        realAudio.append(contentsOf: samples)
+        pendingSamples.append(contentsOf: samples)
         return advance(final: false)
     }
 
@@ -157,127 +146,101 @@ public final class VoxtralRealtimeStreamSession {
 
     private func advance(final: Bool) -> Delta {
         guard !done else { return Delta(text: "", tokenIds: []) }
-        guard !realAudio.isEmpty else { return Delta(text: "", tokenIds: []) }
+        if flushed {
+            pendingSamples.removeAll()   // the final pad sealed the stream
+            guard final else { return Delta(text: "", tokenIds: []) }
+        }
+        // With no audio yet there is nothing to advance — except on finish(), where
+        // the offline path still transcribes the zero-padded empty stream, so the
+        // final pad alone must drive the pipeline to match `generate(...)`.
+        guard final || realSamplesFed + pendingSamples.count > 0 else {
+            return Delta(text: "", tokenIds: [])
+        }
 
         let ds = model.config.encoderArgs.downsampleFactor
+        let audioArgs = model.config.audioEncodingArgs
+        let samplesPerToken = Int(Float(audioArgs.samplingRate) / audioArgs.frameRate) // 1280
 
-        // Mid-stream chunks derive shapes arithmetically and compute only the NEW
-        // conv rows from a bounded sample window (O(1) per chunk). The first chunk
-        // (windowed path needs >= 2 conv rows of left context) and the final flush
-        // (right zero-pad region must match offline exactly) run the full stem.
-        let nAudioTotal: Int
-        let convTotal: Int
-        var fullConvOut: MLXArray?
-
-        if final || encState.consumed < 2 {
-            let (convOut, total, pLen) = model.convStemForAudio(
-                audio: MLXArray(realAudio),
-                transcriptionDelayMs: transcriptionDelayMs
+        if melStream == nil {
+            model.ensureAdaScales(transcriptionDelayMs: transcriptionDelayMs)
+            let delayMs = transcriptionDelayMs ?? model.config.transcriptionDelayMs
+            nDelayTokens = model.numDelayTokens(delayMs)
+            promptLength = 1 + model.config.nLeftPadTokens + nDelayTokens
+            melStream = VoxtralRealtimeMelStream(
+                leftPadSamples: model.config.nLeftPadTokens * samplesPerToken,
+                melFilters: model.ensureMelFilters(),
+                windowSize: audioArgs.windowSize,
+                hopLength: audioArgs.hopLength,
+                globalLogMelMax: audioArgs.globalLogMelMax
             )
-            fullConvOut = convOut
-            nAudioTotal = total
-            convTotal = convOut.shape[0]
-            promptLength = pLen
-        } else {
-            let shapes = streamShapes()
-            nAudioTotal = shapes.nAudioTotal
-            convTotal = shapes.convTotal
-            promptLength = shapes.promptLength
         }
 
-        let realRegion = model.config.nLeftPadTokens + model.numAudioTokens(realAudio.count)
-        let emitLimit = final ? nAudioTotal : max(0, min(nAudioTotal, realRegion - frozenGuardTokens))
-        let convFreeze = min(convTotal, emitLimit * ds)
+        // Move new audio into the mel stream — plus, on finish, the exact right-pad
+        // `prepareMel` would append (token alignment + `(nDelay + 1) + 10` zero
+        // tokens) and the trailing reflect-pad samples.
+        var newSamples = pendingSamples
+        pendingSamples.removeAll(keepingCapacity: true)
+        realSamplesFed += newSamples.count
+        if final && !flushed {
+            let alignPad = (samplesPerToken - realSamplesFed % samplesPerToken) % samplesPerToken
+            let rightPad = ((nDelayTokens + 1) + 10) * samplesPerToken
+            newSamples += [Float](
+                repeating: 0,
+                count: alignPad + rightPad + melStream!.finishTailPadCount
+            )
+            flushed = true
+        }
 
-        if convFreeze > encState.consumed {
-            let newEnc: MLXArray
-            if let fullConvOut {
-                newEnc = model.encoder.feedIncremental(fullConvOut, upTo: convFreeze, state: &encState)
-            } else {
-                let block = convRowsWindowed(from: encState.consumed, to: convFreeze)
-                newEnc = model.encoder.feedIncremental(block: block, state: &encState)
+        let newMel = melStream!.append(newSamples)
+        if newMel.shape[1] > 0 {
+            let rows = model.encoder.convStemStep(newMel, state: &convState)
+            if rows.shape[0] > 0 {
+                convRows = convRows == nil ? rows : MLX.concatenated([convRows!, rows], axis: 0)
             }
+        }
+        let convRowCount = convRows?.shape[0] ?? 0
+
+        // Emit ceiling: the whole-token span covered by real samples minus the
+        // trailing partial-token guard. The offline `min(nAudioTotal, …)` clamp can
+        // never bind before finish (the right-pad spans ≥ 11 tokens past `realRegion`);
+        // after the final pad every produced row is decodable.
+        let realRegion = model.config.nLeftPadTokens + model.numAudioTokens(realSamplesFed)
+        let emitLimit = final ? convRowCount / ds : max(0, realRegion - frozenGuardTokens)
+        let convFreeze = min(convRowCount / ds, emitLimit) * ds
+
+        if convFreeze > encState.consumed, let convRows {
+            let newEnc = model.encoder.feedIncremental(convRows, upTo: convFreeze, state: &encState)
             let rows = model.encoder.downsampleAndProject(newEnc)   // multiple-of-ds ⇒ whole rows
             adapterBuf = adapterBuf == nil ? rows : MLX.concatenated([adapterBuf!, rows], axis: 0)
-            freezeEncoderState()
         }
+        freezeEncoderState()
 
         guard let adapter = adapterBuf else {
-            Memory.clearCache()
             return Delta(text: "", tokenIds: [])
         }
         prefillIfNeeded(adapter: adapter)
         let delta = decode(adapter: adapter, upTo: min(emitLimit, adapter.shape[0]))
 
-        Memory.clearCache()
+        // Per-step clears re-allocate the working set cold 10x/s and defeat the
+        // host's `Memory.cacheLimit`. Match the offline `generate` loop instead:
+        // clear every 256 decoded tokens (see `decode`) plus once on the finish()
+        // flush. The session's KV caches and carried state are still live here, so
+        // a host that wants idle memory back at the weight floor must clear again
+        // after releasing the session.
+        if final {
+            Memory.clearCache()
+        }
         return delta
     }
 
-    /// Padded-audio geometry derived arithmetically (mirrors `padAudioStreaming` +
-    /// `prepareMel` + `convStem` shape math, all multiples of one token's samples,
-    /// so the offline parity-drop / downsample-trunc branches never fire).
-    private func streamShapes() -> (nAudioTotal: Int, convTotal: Int, promptLength: Int) {
-        let cfg = model.config
-        let hop = cfg.audioEncodingArgs.hopLength
-        let ds = cfg.encoderArgs.downsampleFactor
-        let mult = hop * 2 * ds   // raw samples per audio token (160*2*4 = 1280)
-
-        let delayMs = transcriptionDelayMs ?? cfg.transcriptionDelayMs
-        let nDelay = model.numDelayTokens(delayMs)
-        let nRight = (nDelay + 1) + 10
-        let alignPad = (mult - (realAudio.count % mult)) % mult
-        let paddedLen = cfg.nLeftPadTokens * mult + realAudio.count + alignPad + nRight * mult
-
-        let convTotal = paddedLen / hop / 2
-        return (convTotal / ds, convTotal, 1 + cfg.nLeftPadTokens + nDelay)
-    }
-
-    /// Conv-stem rows `[from, to)` recomputed from a bounded raw-sample window —
-    /// bit-equal to `convStem(prepareMel(fullAudio))[from..<to]` for `from >= 2`:
-    /// conv row f needs mel frames [2f-3, 2f+1]; mel frame m covers samples
-    /// [m*hop - win/2, m*hop + win/2) of the left-padded audio (the STFT reflect
-    /// pad resolves to zeros because the left pad is >= win/2 zeros, and frozen
-    /// frames never reach the right pad — guarded by `frozenGuardTokens`).
-    private func convRowsWindowed(from: Int, to: Int) -> MLXArray {
-        let a = model.config.audioEncodingArgs
-        let hop = a.hopLength
-        let win = a.windowSize
-        let leftZeros = model.config.nLeftPadTokens * hop * 2 * model.config.encoderArgs.downsampleFactor
-
-        let m0 = 2 * from - 3
-        let mCount = 2 * (to - from) + 3
-        let s0 = m0 * hop - win / 2
-        let total = (mCount - 1) * hop + win
-        precondition(s0 + total - leftZeros <= realAudio.count,
-                     "windowed conv-stem read past available audio")
-
-        var buf = [Float](repeating: 0, count: total)
-        for i in 0..<total {
-            let j = s0 + i - leftZeros
-            if j >= 0 { buf[i] = realAudio[j] }
-        }
-
-        // Mel: identical op chain to `computeMelSpectrogram` (the global last-frame
-        // drop never lands in this window; the log-mel floor is a global constant).
-        let frames = asStrided(MLXArray(buf), [mCount, win], strides: [hop, 1], offset: 0) * hannWindow
-        var mags = MLX.abs(MLXFFT.rfft(frames, axis: -1)).square()
-        mags = mags.transposed(1, 0)
-        var logSpec = MLX.log10(MLX.maximum(MLX.matmul(melFilters.transposed(1, 0), mags), MLXArray(Float(1e-10))))
-        logSpec = MLX.maximum(logSpec, MLXArray(a.globalLogMelMax - 8.0))
-        logSpec = (logSpec + MLXArray(Float(4.0))) / MLXArray(Float(4.0))
-
-        // Valid (un-padded) convs over the window: the causal left context is the
-        // extra mel frames included above, so outputs align exactly to [from, to).
-        var x = logSpec.transposed(1, 0).expandedDimensions(axis: 0)
-        x = gelu(model.encoder.convLayers0Conv.conv(x))
-        x = gelu(model.encoder.convLayers1Conv.conv(x))
-        return x.squeezed(axis: 0)
-    }
-
-    /// Materialise the adapter buffer + encoder caches so the lazy graph stays bounded
-    /// across chunks (each chunk would otherwise extend one unbroken graph).
+    /// Materialise the carried front-end arrays (conv rows + conv tails), the adapter
+    /// buffer, and the encoder caches so the lazy graph stays bounded across chunks
+    /// (each chunk would otherwise extend one unbroken graph).
     private func freezeEncoderState() {
         var arrays: [MLXArray] = []
+        if let convRows { arrays.append(convRows) }
+        if let carry = convState.conv1Carry { arrays.append(carry) }
+        if let carry = convState.conv2Carry { arrays.append(carry) }
         if let adapterBuf { arrays.append(adapterBuf) }
         for cache in encState.caches {
             if let cache { arrays.append(cache.keys); arrays.append(cache.values) }
@@ -305,26 +268,14 @@ public final class VoxtralRealtimeStreamSession {
     }
 
     private func decode(adapter: MLXArray, upTo emitLimit: Int) -> Delta {
-        guard prefilled, let startLogits = lastLogits else { return Delta(text: "", tokenIds: []) }
+        guard prefilled else { return Delta(text: "", tokenIds: []) }
 
         var newIds: [Int] = []
         // Mirrors the offline `generate` loop exactly (append → check → pop trailing
-        // EOS) so the streamed token stream is identical at temperature 0. Same
-        // pipelined pattern as offline: queue the next step before reading the token.
-        var pendingToken = model.sampleLazy(logits: startLogits, temperature: temperature)
-        if decPos < emitLimit { MLX.asyncEval(pendingToken) }
-
+        // EOS) so the streamed token stream is identical at temperature 0.
         while decPos < emitLimit {
-            let tokenEmbed = model.decoder.embedTokens(pendingToken.reshaped([1]))
-            let inputEmbed = decPos < adapter.shape[0]
-                ? adapter[decPos..<(decPos + 1), 0...] + tokenEmbed
-                : tokenEmbed
-            let next = model.decoder(inputEmbed, startPos: decPos, cache: decCache)
-            let nextLogits = model.decoder.logits(next.0[0])
-            let nextToken = model.sampleLazy(logits: nextLogits, temperature: temperature)
-            MLX.asyncEval(nextToken)
-
-            let token = pendingToken.item(Int.self)
+            guard let logits = lastLogits else { break }
+            let token = model.sample(logits: logits, temperature: temperature)
             generated.append(token)
 
             if token == model.config.eosTokenId || generated.count > maxTokens {
@@ -334,10 +285,23 @@ public final class VoxtralRealtimeStreamSession {
             }
             newIds.append(token)
 
+            let tokenEmbed = model.decoder.embedToken(tokenId: token)
+            let inputEmbed = decPos < adapter.shape[0]
+                ? adapter[decPos] + tokenEmbed
+                : tokenEmbed
+            let next = model.decoder(
+                inputEmbed.expandedDimensions(axis: 0),
+                startPos: decPos,
+                cache: decCache
+            )
             decCache = next.1
-            lastLogits = nextLogits
-            pendingToken = nextToken
+            lastLogits = model.decoder.logits(next.0[0])
             decPos += 1
+            MLX.eval(lastLogits!)
+            // Same cadence as the offline `generate` loop.
+            if generated.count % 256 == 0 {
+                Memory.clearCache()
+            }
         }
 
         let textSoFar = model.decodeStreaming(generated)
@@ -364,6 +328,50 @@ public extension VoxtralRealtimeModel {
             temperature: temperature,
             maxTokens: maxTokens,
             transcriptionDelayMs: transcriptionDelayMs
+        )
+    }
+
+    /// Transcribe a whole audio buffer through the online streaming session, feeding
+    /// fixed `chunkMs`-sized chunks as a live caller would — instead of the whole-buffer
+    /// `generateStream`. `onDelta` receives each newly decoded fragment as it is produced
+    /// (use it to render live output); the returned `STTOutput` is the full transcript.
+    func transcribeStreaming(
+        audio: MLXArray,
+        generationParameters: STTGenerateParameters = STTGenerateParameters(),
+        chunkMs: Int = 480,
+        onDelta: ((String) -> Void)? = nil
+    ) -> STTOutput {
+        let mono = audio.ndim > 1 ? audio.mean(axis: -1) : audio
+        let samples = mono.asType(.float32).asArray(Float.self)
+        let chunk = max(1, 16000 * chunkMs / 1000)
+
+        let session = makeStreamSession(
+            temperature: generationParameters.temperature,
+            maxTokens: generationParameters.maxTokens
+        )
+        let start = CFAbsoluteTimeGetCurrent()
+
+        func emit(_ delta: VoxtralRealtimeStreamSession.Delta) {
+            guard !delta.text.isEmpty else { return }
+            onDelta?(delta.text)
+        }
+        var idx = 0
+        while idx < samples.count {
+            let end = min(idx + chunk, samples.count)
+            emit(session.step(Array(samples[idx..<end])))
+            idx = end
+        }
+        emit(session.finish())
+
+        let totalTime = CFAbsoluteTimeGetCurrent() - start
+        let tokenCount = session.tokens.count
+        return STTOutput(
+            text: session.text.trimmingCharacters(in: .whitespacesAndNewlines),
+            language: generationParameters.language,
+            generationTokens: tokenCount,
+            totalTokens: tokenCount,
+            generationTps: totalTime > 0 ? Double(tokenCount) / totalTime : 0,
+            totalTime: totalTime
         )
     }
 }

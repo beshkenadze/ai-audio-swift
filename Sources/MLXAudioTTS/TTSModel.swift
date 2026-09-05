@@ -102,6 +102,13 @@ public enum TTS {
         }
 
         switch resolvedType {
+        case "breeze", "breeze_tts":
+            return try await load(
+                source,
+                modelType: resolvedType,
+                pretrained: { try await BreezeTTSModel.fromPretrained($0, cache: $1) },
+                local: { modelDir, _ in try await BreezeTTSModel.fromModelDirectory(modelDir) }
+            )
         case "moss_tts_nano":
             return try await load(
                 source,
@@ -201,6 +208,19 @@ public enum TTS {
                 pretrained: { try await KokoroModel.fromPretrained($0, textProcessor: processor, cache: $1) },
                 local: { modelDir, _ in try await KokoroModel.fromModelDirectory(modelDir, textProcessor: processor) }
             )
+        case "omnivoice":
+            return try await load(
+                source,
+                modelType: resolvedType,
+                pretrained: { try await OmniVoiceModel.fromPretrained($0, cache: $1) }
+            )
+        case "indextts", "index_tts":
+            return try await load(
+                source,
+                modelType: resolvedType,
+                pretrained: { try await IndexTTSModel.fromPretrained($0, cache: $1) },
+                local: { modelDir, _ in try await IndexTTSModel.fromModelDirectory(modelDir) }
+            )
         default:
             throw TTSModelError.unsupportedModelType(resolvedType)
         }
@@ -259,6 +279,9 @@ public enum TTS {
 
     private static func inferModelType(from modelRepo: String) -> String? {
         let lower = modelRepo.lowercased()
+        if lower.contains("breeze") && lower.contains("tts") {
+            return "breeze"
+        }
         // Repo names are hyphenated (e.g. "Irodori-TTS-600M-…"); match the bare name.
         if lower.contains("irodori") {
             return "irodori_tts"
@@ -309,6 +332,12 @@ public enum TTS {
         }
         if lower.contains("kokoro") {
             return "kokoro"
+        }
+        if lower.contains("omnivoice") {
+            return "omnivoice"
+        }
+        if lower.contains("indextts") || lower.contains("index-tts") || lower.contains("index_tts") {
+            return "indextts"
         }
         return nil
     }
