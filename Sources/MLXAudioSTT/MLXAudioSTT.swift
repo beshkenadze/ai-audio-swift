@@ -79,6 +79,8 @@ public enum STT {
             return try await WhisperModel.fromPretrained(modelRepo, cache: cache)
         case "granite_speech":
             return try await GraniteSpeechModel.fromPretrained(modelRepo, cache: cache)
+        case "vibevoice_asr_streaming", "vibevoice":
+            return try await VibeVoiceASRStreamingModel.fromPretrained(modelRepo, cache: cache)
         default:
             throw STTModelError.unsupportedModelType(resolved)
         }
@@ -141,6 +143,9 @@ public enum STT {
         }
         if lower.contains("granite") {
             return "granite_speech"
+        }
+        if lower.contains("vibevoice") {
+            return "vibevoice_asr_streaming"
         }
         return nil
     }
