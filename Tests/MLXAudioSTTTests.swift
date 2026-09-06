@@ -3255,6 +3255,7 @@ struct ParakeetSTTTests {
     }
 }
 
+@Suite(.serialized)
 struct NemotronASRTests {
     private var mlxRuntimeEnabled: Bool {
         ProcessInfo.processInfo.environment["MLXAUDIO_ENABLE_MLX_RUNTIME_TESTS"] == "1"
@@ -3545,10 +3546,17 @@ struct NemotronASRTests {
             print("Skipping Nemotron ASR MLX runtime test. Set MLXAUDIO_ENABLE_MLX_RUNTIME_TESTS=1 to enable.")
             return
         }
+        // Deterministic init: unseeded random weights overwhelmingly collapse the tiny
+        // RNNT decoder to all-blank output (a random, untrained blank-heavy prior is
+        // common for RNNT), which would make the parity check below pass vacuously on
+        // two empty strings instead of exercising real decoding. Seed 299 is one of the
+        // few in [0, 300) that reliably emits non-blank tokens for this fixture.
+        MLXRandom.seed(299)
         let model = try tinyModel()
         let audio = syntheticAudio(samples: 6000)
         let whole = try await wholeStreamText(model, audio)
         let (sessioned, tokens) = sessionText(model, audio, feed: 200)
+        #expect(!whole.isEmpty)  // guards against a vacuous pass below
         #expect(sessioned == whole)
         #expect(tokens.isEmpty == false)  // random weights still emit non-blank tokens
     }
@@ -3559,10 +3567,14 @@ struct NemotronASRTests {
             print("Skipping Nemotron ASR MLX runtime test. Set MLXAUDIO_ENABLE_MLX_RUNTIME_TESTS=1 to enable.")
             return
         }
+        // See streamSessionMatchesGenerateStream: seed to avoid a degenerate
+        // all-blank init, which would make this check pass vacuously on "" == "".
+        MLXRandom.seed(299)
         let model = try tinyModel()
         let audio = syntheticAudio(samples: 6000)
         let (fine, _) = sessionText(model, audio, feed: 96)
         let (coarse, _) = sessionText(model, audio, feed: 1500)
+        #expect(!fine.isEmpty)  // guards against a vacuous pass below
         #expect(fine == coarse)
     }
 }
