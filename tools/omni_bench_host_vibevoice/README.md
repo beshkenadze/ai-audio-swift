@@ -97,7 +97,7 @@ export PYTHONPATH=/mnt/d/Projects/vibevoice-official
   --out vv-cuda.jsonl
 ```
 
-Tunables (all optional): `VIBEVOICE_DTYPE` (default `bfloat16`),
+Tunables (all optional): `VIBEVOICE_DTYPE` (default `float32`, see below),
 `VIBEVOICE_CHUNK_DURATION` (2.0), `VIBEVOICE_TEXT_AUDIO_DELAY` (0.5),
 `VIBEVOICE_MAX_NEW_TOKENS` (256), `VIBEVOICE_TEMPERATURE` (0.0),
 `VIBEVOICE_MODEL_ID`, `VIBEVOICE_ARTIFACT_SHA256`.
@@ -153,24 +153,60 @@ uv run --project python omni-bench parity --manifest <manifest> \
 
 ### Results so far
 
-**`asr.fleurs.en.quick.v1`, arm B (Swift/MLX, 64 real-speech samples)** — 64/64
-OK, no sample errors:
+**`asr.fleurs.en.quick.v1`, 64 real-speech samples, `batch_single`.** Both arms
+ran 64/64 with no sample errors. A = PyTorch/CUDA on a 4090, B = Swift/MLX on an
+M1 Max.
 
-| metric | value |
-|---|---|
-| `quality.wer_norm.v1` | 0.581 |
-| `quality.wer_ortho.v1` | 0.703 |
-| `quality.cer.v1` | 0.458 |
-| `latency.request_completion_s.v1` p50 | 2.01 s |
-| `throughput.audio_rtfx_wall.v1` | 4.77 |
-| `resources.peak_process_rss_gb.v1` | 4.63 |
+| metric | A cuda fp32 | B swift | B − A |
+|---|---|---|---|
+| `quality.wer_norm.v1` | 0.5836 | 0.5807 | **−0.0028** |
+| `quality.wer_ortho.v1` | 0.6992 | 0.7034 | +0.0042 |
+| `quality.cer.v1` | 0.4594 | 0.4577 | −0.0018 |
+| `latency.request_completion_s.v1` p50 | 1.54 s | 2.01 s | +0.47 s |
+| `throughput.audio_rtfx_wall.v1` | 6.21 | 4.77 | −1.45 |
+| `resources.peak_process_rss_gb.v1` | 13.31 | 4.63 | −8.67 |
 
-The absolute WER is high for a 1.5B streaming diarization model asked to
-transcribe short read sentences in 2 s windows; it is reported here as a
-baseline for the arm comparison, not as a quality claim.
+The `quality.wer_norm.v1` parity gate (`abs_lte 0.005`) **passes**: the port and
+the reference are the same quality to within 0.3 % WER on real speech.
 
-The matching CUDA run is still outstanding, so **no cross-arm quality
-comparison on real speech has been made yet.**
+The absolute WER is high because a 1.5 B streaming diarization model is being
+asked to transcribe short read sentences in 2 s windows. That is a property of
+the Task, not of either arm, and it is the same for both.
+
+**`parity.hypothesis_identity.v1` is 0.64, not 1.0** — 39 of 64 hypotheses are
+byte-identical, the rest differ by a word or two (one arm hears
+`"the romantic and fascinating term is"` where the other hears
+`"romantic and fascinating, Thomas Hardy"`). This is
+expected rather than alarming: decoding is greedy, so a near-tie argmax flipped
+by the last bits of a different matmul kernel changes one token and the
+autoregressive context then carries the divergence to the end of the chunk.
+Earlier work established *token-for-token* equality on a fixed multi-chunk
+clip; that equality does not survive being replayed across 64 clips × hundreds
+of steps on different silicon. The aggregate quality metric is the meaningful
+one here, and it agrees.
+
+#### Why the dtype default changed
+
+The first CUDA run used this host's original `bfloat16` default and produced
+`wer_norm` 0.781 against the port's 0.581 — a 0.20 gap that looked like a
+broken port. It was not:
+
+| arm | wer_norm | identical to B |
+|---|---|---|
+| A cuda **bf16** | 0.7812 | 18/64 |
+| A cuda **fp32** | 0.5836 | 39/64 |
+| B swift | 0.5807 | — |
+
+The checkpoint stores every tensor as BF16 but declares `torch_dtype: float32`
+at the top level and `bfloat16` only for the decoder. `model.to(bfloat16)`
+ignores that split and downcasts the acoustic and semantic VAE encoders too,
+which is where the quality went. MLX, meanwhile, keeps the stored BF16 weights
+but type-promotes them against the fp32 audio activations, so the port's
+effective compute precision tracks the fp32 PyTorch run.
+
+So the host now defaults to `float32`, which is both what the checkpoint asks
+for and what makes the two arms comparable. Left at `bfloat16` it would have
+charged the port with a 0.20 WER regression owned entirely by this file.
 
 ### Known limitations
 

@@ -466,7 +466,18 @@ def make():
     if not model_path:
         raise RuntimeError("VIBEVOICE_MODEL_PATH is required")
 
-    dtype_name = os.environ.get("VIBEVOICE_DTYPE", "bfloat16")
+    # float32 by default, matching the checkpoint's own top-level
+    # `torch_dtype: float32`. Forcing bfloat16 across the whole graph is not a
+    # free speedup here: on asr.fleurs.en.quick.v1 it moved wer_norm from
+    # 0.584 to 0.781 (measured), because `model.to(bfloat16)` also downcasts
+    # the acoustic/semantic VAE encoders that the config keeps in fp32.
+    #
+    # It also makes this arm incomparable to the MLX arm. MLX keeps the bf16
+    # weights as stored but type-promotes against the fp32 audio activations,
+    # so its effective compute precision tracks the fp32 PyTorch run, not the
+    # bf16 one. Defaulting to bfloat16 would therefore charge the port with a
+    # ~0.20 WER gap that belongs to this host's dtype handling.
+    dtype_name = os.environ.get("VIBEVOICE_DTYPE", "float32")
     dtype = {"float32": torch.float32, "bfloat16": torch.bfloat16,
              "float16": torch.float16}[dtype_name]
 
