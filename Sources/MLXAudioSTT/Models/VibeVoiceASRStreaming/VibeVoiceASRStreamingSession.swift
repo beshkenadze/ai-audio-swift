@@ -36,6 +36,7 @@ import Foundation
 import MLX
 import MLXLMCommon
 import MLXNN
+import Tokenizers
 
 // MARK: - Parameters
 
@@ -86,11 +87,17 @@ public struct VibeVoiceASRStreamingChunk: Sendable {
     /// an open-ended live session.
     public let totalChunks: Int?
     public let text: String
+    /// Token ids generated for this chunk, before decoding and before the
+    /// framing tokens are stripped. Exposed because comparing transcripts
+    /// alone hides compensating errors -- two different token sequences can
+    /// decode to the same string.
+    public let tokenIds: [Int]
 
-    public init(index: Int, totalChunks: Int?, text: String) {
+    public init(index: Int, totalChunks: Int?, text: String, tokenIds: [Int] = []) {
         self.index = index
         self.totalChunks = totalChunks
         self.text = text
+        self.tokenIds = tokenIds
     }
 }
 
@@ -318,18 +325,25 @@ public final class VibeVoiceASRStreamSession {
     private func consume(window: [Float]) -> VibeVoiceASRStreamingChunk {
         let audio = MLXArray(window)[.newAxis, .ellipsis]
         let features = model.encodeSpeech(audio)
-        let text = step(features: features)
+        let tokenIds = step(features: features)
         let chunk = VibeVoiceASRStreamingChunk(
-            index: chunkIndex, totalChunks: totalChunksHint, text: text)
+            index: chunkIndex, totalChunks: totalChunksHint,
+            text: Self.decodeChunk(tokenIds, tokenizer: model.tokenizer), tokenIds: tokenIds)
         chunkIndex += 1
         onChunk?(chunk)
         return chunk
     }
 
+    static func decodeChunk(_ tokenIds: [Int], tokenizer: Tokenizers.Tokenizer?) -> String {
+        cleanChunkText(tokenizer?.decode(tokens: tokenIds, skipSpecialTokens: true) ?? "")
+    }
+
     /// Mirrors `streaming_generate_step`: feed `[sp_start, features,
     /// sp_end]`, greedily decode until `<|text_chunk_end|>` / EOS / budget,
     /// then unconditionally commit `<|text_chunk_end|>` to the cache.
-    func step(features: MLXArray) -> String {
+    /// Returns the chunk's generated token ids; decoding to text is the
+    /// caller's job so the raw ids stay available for parity bisection.
+    func step(features: MLXArray) -> [Int] {
         let audioEmbeds = MLX.concatenated([spStartEmbed, features, spEndEmbed], axis: 1)
         var logits = model(inputsEmbeds: audioEmbeds, cache: cache)
         eval(logits)
@@ -372,8 +386,7 @@ public final class VibeVoiceASRStreamSession {
         // file.
         _ = model(inputsEmbeds: tceEmbed, cache: cache)
 
-        return Self.cleanChunkText(
-            model.tokenizer?.decode(tokens: chunkTokens, skipSpecialTokens: true) ?? "")
+        return chunkTokens
     }
 
     /// `skipSpecialTokens` does not remove the repurposed framing tokens
