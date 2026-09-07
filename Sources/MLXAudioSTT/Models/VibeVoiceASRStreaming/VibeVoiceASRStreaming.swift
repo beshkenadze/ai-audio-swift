@@ -63,11 +63,25 @@ public final class VibeVoiceASRStreamingModel: Module {
 
     public var tokenizer: Tokenizers.Tokenizer?
 
-    /// Resolved once the tokenizer is loaded; repurposed Qwen2.5 special
-    /// tokens (matches `_build_prompt_tokens` in the Python reference).
-    private var speechStartId: Int = 0
-    private var speechPadId: Int = 0
-    private var speechEndId: Int = 0
+    /// Resolved once the tokenizer is loaded. The streaming checkpoints
+    /// repurpose Qwen2.5 vision/box tokens for speech framing -- see
+    /// `modular_vibevoice_text_tokenizer.py:276-282`:
+    ///   speech_start == `<|object_ref_start|>` (151646)
+    ///   speech_end   == `<|object_ref_end|>`   (151647)
+    ///   speech_pad   == `<|box_start|>`        (151648)
+    /// and train `<|text_chunk_end|>` (151665) into the first free slot
+    /// after Qwen2.5 -- it lives only in `added_tokens.json`, never in the
+    /// base vocabulary, so it may legitimately be absent.
+    public private(set) var speechStartId: Int = 0
+    public private(set) var speechPadId: Int = 0
+    public private(set) var speechEndId: Int = 0
+    /// `nil` on a checkpoint whose tokenizer lacks `<|text_chunk_end|>` --
+    /// such a checkpoint can never terminate a streaming chunk.
+    public private(set) var textChunkEndId: Int?
+    /// The tokenizer's true `eos_token_id` (`<|endoftext|>` for these
+    /// checkpoints); this alone is what the reference streaming loop
+    /// compares against.
+    public private(set) var eosTokenId: Int = 0
     private var eosTokenIds: [Int] = []
 
     public let sampleRate: Int
@@ -173,6 +187,17 @@ public final class VibeVoiceASRStreamingModel: Module {
         return languageModel(inputsEmbeds: inputsEmbeds, cache: cache)
     }
 
+    /// Forward from pre-built embeddings -- the entry point the streaming
+    /// loop needs, since it feeds `[sp_start, audio_features, sp_end]`
+    /// concatenations that have no token-id representation.
+    func callAsFunction(inputsEmbeds: MLXArray, cache: [KVCache]?) -> MLXArray {
+        languageModel(inputsEmbeds: inputsEmbeds, cache: cache)
+    }
+
+    /// Embedding lookup for a literal token-id sequence.
+    func embed(tokenIds: [Int]) -> MLXArray {
+        languageModel.model.embedTokens(MLXArray(tokenIds.map { Int32($0) })[.newAxis, .ellipsis])
+    }
     public func makeCache() -> [KVCache] {
         languageModel.makeCache()
     }
@@ -257,8 +282,10 @@ public final class VibeVoiceASRStreamingModel: Module {
         speechStartId = tokenizer.convertTokenToId("<|object_ref_start|>") ?? 0
         speechPadId = tokenizer.convertTokenToId("<|box_start|>") ?? 0
         speechEndId = tokenizer.convertTokenToId("<|object_ref_end|>") ?? 0
+        textChunkEndId = tokenizer.convertTokenToId("<|text_chunk_end|>")
         let eot = tokenizer.convertTokenToId("<|endoftext|>")
         let imEnd = tokenizer.convertTokenToId("<|im_end|>")
+        eosTokenId = eot ?? 0
         eosTokenIds = [eot, imEnd].compactMap { $0 }
     }
 
