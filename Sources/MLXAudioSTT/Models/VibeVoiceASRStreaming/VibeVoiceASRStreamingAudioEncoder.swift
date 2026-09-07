@@ -336,10 +336,30 @@ final class VibeVoiceAcousticTokenizerEncoder: Module {
         self._encoder.wrappedValue = VibeVoiceTokenizerEncoder(config: config)
     }
 
-    /// Deterministic mean latent -- matches the Python reference's
-    /// `Model.encode_speech()` calling `tokenizer.encode(...)` directly.
-    /// Never call `.sample()`/add noise on the ASR inference path: doing so
-    /// would make output nondeterministic and break CUDA/Swift parity.
+    /// Returns the VAE mean latent, deterministically.
+    ///
+    /// This is a DELIBERATE DEVIATION from the official PyTorch reference.
+    /// `VibeVoiceASRForConditionalGeneration.encode_speech` does not use the
+    /// mean; it calls `encoder_output.sample(dist_type=std_dist_type)`, and
+    /// the released checkpoints configure the acoustic tokenizer with
+    /// `std_dist_type="gaussian"`, `fix_std=0.5`:
+    ///
+    ///     std = randn(batch) * (fix_std / 0.8)
+    ///     x   = mean + std * randn_like(mean)
+    ///
+    /// so the reference injects fresh Gaussian noise into the acoustic
+    /// latent on every ASR inference call -- leftover VAE training
+    /// behaviour, not something transcription needs. Measured on the 1.5B
+    /// checkpoint, that noise moves the connector sum by ~4e-2 relative and
+    /// the first-step logits by ~9e-2 relative, and it reorders the logit
+    /// top-5 between runs.
+    ///
+    /// Taking the mean makes transcription reproducible and is what the
+    /// parity suite compares against. The semantic tokenizer needs no such
+    /// decision: its `sampling()` hardcodes `dist_type='none'`, which
+    /// returns the mean unchanged.
+    ///
+    /// See `Tests/VibeVoiceASRStreamingParityTests.swift`.
     func encode(_ audio: MLXArray) -> MLXArray {
         encoder(audio)
     }

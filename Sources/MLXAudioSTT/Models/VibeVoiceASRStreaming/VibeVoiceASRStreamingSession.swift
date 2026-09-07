@@ -97,6 +97,7 @@ public struct VibeVoiceASRStreamingChunk: Sendable {
 public enum VibeVoiceStreamingError: Error, LocalizedError {
     case tokenizerMissing
     case textChunkEndTokenMissing
+    case invalidChunkDuration(Double)
 
     public var errorDescription: String? {
         switch self {
@@ -107,6 +108,11 @@ public enum VibeVoiceStreamingError: Error, LocalizedError {
                 "VibeVoice ASR streaming: this checkpoint's tokenizer has no "
                 + "<|text_chunk_end|>, so no chunk could ever terminate. Use a "
                 + "streaming checkpoint (its added_tokens.json defines the token)."
+        case .invalidChunkDuration(let duration):
+            return
+                "VibeVoice ASR streaming: chunkDuration \(duration)s is shorter than "
+                + "one audio sample, which would leave the window cursor unable to "
+                + "advance. Use a positive duration of at least one sample."
         }
     }
 }
@@ -137,6 +143,12 @@ struct VibeVoiceWindowBuffer {
     private var flushed = false
 
     init(chunkSamples: Int, lookaheadSamples: Int, padLastChunk: Bool) {
+        // A zero stride would make `push`/`flush` spin forever: the cursor
+        // never advances, so the same window is emitted endlessly. Fail
+        // loudly at construction instead of hanging the caller's audio
+        // thread.
+        precondition(chunkSamples > 0, "VibeVoiceWindowBuffer: chunkSamples must be > 0")
+        precondition(lookaheadSamples >= 0, "VibeVoiceWindowBuffer: lookaheadSamples must be >= 0")
         self.chunkSamples = chunkSamples
         self.lookaheadSamples = lookaheadSamples
         self.padLastChunk = padLastChunk
@@ -232,7 +244,13 @@ public final class VibeVoiceASRStreamSession {
         self.eosId = model.eosTokenId
 
         let sampleRate = model.sampleRate
-        self.chunkSamples = Int(parameters.chunkDuration * Double(sampleRate))
+        // Guard before truncation, not after: a positive-but-tiny duration
+        // (< 1 sample) still floors to a zero stride.
+        let requestedChunkSamples = Int(parameters.chunkDuration * Double(sampleRate))
+        guard requestedChunkSamples > 0 else {
+            throw VibeVoiceStreamingError.invalidChunkDuration(parameters.chunkDuration)
+        }
+        self.chunkSamples = requestedChunkSamples
 
         // Snap the lookahead to a whole tokenizer frame
         // (`modeling_vibevoice_asr.py:499-502`): with hop=3200 @ 24 kHz a

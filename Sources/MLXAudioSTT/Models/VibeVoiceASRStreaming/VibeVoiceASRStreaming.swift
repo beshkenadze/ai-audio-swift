@@ -215,6 +215,16 @@ public final class VibeVoiceASRStreamingModel: Module {
             if rawKey.contains("diffusion_head") || rawKey.contains("prediction_head") {
                 continue
             }
+            // The tokenizers are full VAEs in the checkpoint, but ASR only
+            // ever runs their encoders; their decoders reconstruct audio for
+            // TTS. Matched by the tokenizer-qualified prefix specifically --
+            // a bare "decoder" test would also swallow the language model's
+            // own decoder layers.
+            if rawKey.contains("acoustic_tokenizer.decoder")
+                || rawKey.contains("semantic_tokenizer.decoder")
+            {
+                continue
+            }
             if rawKey.hasSuffix("position_ids") || rawKey.hasSuffix("fix_std")
                 || rawKey.contains("num_batches_tracked")
             {
@@ -381,7 +391,18 @@ public final class VibeVoiceASRStreamingModel: Module {
             weights.merge(fileWeights) { _, new in new }
         }
 
-        let sanitizedWeights = VibeVoiceASRStreamingModel.sanitize(weights: weights)
+        var sanitizedWeights = VibeVoiceASRStreamingModel.sanitize(weights: weights)
+
+        // The released streaming checkpoints declare `tie_word_embeddings:
+        // true` and ALSO ship a materialized `lm_head.weight`. Verified
+        // bit-identical to `embed_tokens.weight` on the 1.5B checkpoint, so
+        // dropping it keeps the tied path the config asks for instead of
+        // silently un-tying the model.
+        if config.decoderConfig.tieWordEmbeddings {
+            for key in sanitizedWeights.keys where key.hasPrefix("language_model.lm_head.") {
+                sanitizedWeights.removeValue(forKey: key)
+            }
+        }
 
         if let perLayerQuantization = config.perLayerQuantization {
             quantize(model: model) { path, _ in
