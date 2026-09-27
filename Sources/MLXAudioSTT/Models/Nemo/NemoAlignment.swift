@@ -18,6 +18,12 @@ public struct NemoAlignedToken: Sendable {
     }
 }
 
+public struct NemoAlignedWord: Sendable {
+    public let text: String
+    public let start: Double
+    public let end: Double
+}
+
 public struct NemoAlignedSentence: Sendable {
     public let text: String
     public let tokens: [NemoAlignedToken]
@@ -38,6 +44,24 @@ public struct NemoAlignedSentence: Sendable {
     public var duration: Double {
         end - start
     }
+
+    /// The sentence's words with their tokens' timings. A token whose text starts with a space
+    /// (SentencePiece `▁`) starts a word; the rest, punctuation included, extend the current one.
+    public var words: [NemoAlignedWord] {
+        var groups: [[NemoAlignedToken]] = []
+        for token in tokens {
+            if token.text.hasPrefix(" ") || groups.isEmpty {
+                groups.append([token])
+            } else {
+                groups[groups.count - 1].append(token)
+            }
+        }
+        return groups.compactMap { group in
+            let text = group.map(\.text).joined().trimmingCharacters(in: .whitespaces)
+            guard !text.isEmpty, let first = group.first, let last = group.last else { return nil }
+            return NemoAlignedWord(text: text, start: first.start, end: last.end)
+        }
+    }
 }
 
 public struct NemoAlignedResult: Sendable {
@@ -55,6 +79,7 @@ public struct NemoAlignedResult: Sendable {
                 "text": $0.text,
                 "start": $0.start,
                 "end": $0.end,
+                "words": $0.words.map { ["text": $0.text, "start": $0.start, "end": $0.end] as [String: Any] },
             ]
         }
     }

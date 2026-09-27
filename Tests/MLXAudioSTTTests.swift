@@ -2256,6 +2256,24 @@ struct ParakeetSTTTests {
         #expect(text == " hello.")
     }
 
+    @Test func sentenceWordsCarryTheirTokensTimings() throws {
+        let sentence = ParakeetAlignedSentence(text: " Hello world.", tokens: [
+            .init(id: 1, text: " Hel", start: 0.0, duration: 0.1),
+            .init(id: 2, text: "lo", start: 0.1, duration: 0.1),
+            .init(id: 3, text: " world", start: 0.3, duration: 0.2),
+            .init(id: 4, text: ".", start: 0.5, duration: 0.25),
+        ])
+
+        #expect(sentence.words.map(\.text) == ["Hello", "world."])
+        #expect(sentence.words.map(\.start) == [0.0, 0.3])
+        #expect(sentence.words.map(\.end) == [0.2, 0.75])
+
+        let result = NemoAlignedResult(text: sentence.text, sentences: [sentence])
+        let words = try #require(result.segments.first?["words"] as? [[String: Any]])
+        #expect(words.map { $0["text"] as? String } == ["Hello", "world."])
+        #expect(words.map { $0["start"] as? Double } == [0.0, 0.3])
+    }
+
     @Test func alignmentSentenceAndMergeUtilities() throws {
         let tokens: [ParakeetAlignedToken] = [
             .init(id: 1, text: "Hi", start: 0.0, duration: 0.2),
