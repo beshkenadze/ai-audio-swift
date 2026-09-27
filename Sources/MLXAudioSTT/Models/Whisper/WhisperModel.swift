@@ -183,6 +183,34 @@ public final class WhisperModel: Module, STTGenerationModel {
 
     // MARK: - Single-chunk transcription
 
+    /// Language probabilities for the first 30 s of `audio` (16 kHz mono), likeliest first: one
+    /// decoder step after <|startoftranscript|>, scored over the language tokens only, as
+    /// OpenAI's `detect_language` does. Empty for an English-only model.
+    public func detectLanguage(audio: MLXArray) -> [(language: String, probability: Float)] {
+        guard let tokenizer else {
+            fatalError("WhisperTokenizer not loaded — call fromPretrained / fromDirectory before detectLanguage.")
+        }
+        let languages = tokenizer.languageToId.sorted { $0.value < $1.value }
+        guard tokenizer.isMultilingual, !languages.isEmpty else { return [] }
+
+        let features = WhisperAudio.encoderFeatures(audio: audio, nMels: config.numMelBins)
+        let encoderHidden = model.encoder(features)
+        var caches = (0..<config.decoderLayers).map { _ in WhisperLayerCache() }
+        let hidden = model.decoder(
+            tokens: MLXArray([Int32(tokenizer.startOfTranscriptId)]).expandedDimensions(axis: 0),
+            startPosition: 0,
+            encoderHidden: encoderHidden,
+            caches: &caches
+        )
+        let logits = model.decoder.projectToVocab(hidden[0, -1])
+        let languageLogits = take(logits, MLXArray(languages.map { Int32($0.value) }), axis: 0)
+        let probabilities = softmax(languageLogits.asType(.float32), axis: -1).asArray(Float.self)
+
+        return zip(languages, probabilities)
+            .map { (language: $0.key, probability: $1) }
+            .sorted { $0.probability > $1.probability }
+    }
+
     private func transcribeChunk(
         audio: MLXArray,
         generationParameters: STTGenerateParameters,

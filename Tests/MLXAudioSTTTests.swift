@@ -3595,6 +3595,24 @@ struct WhisperNetworkTests {
         #expect(output.generationTokens > 0)
     }
 
+    @Test func whisperDetectsTheLanguageOfEnglishSpeech() async throws {
+        let env = ProcessInfo.processInfo.environment
+        guard env["MLXAUDIO_ENABLE_NETWORK_TESTS"] == "1" else {
+            print("Skipping network Whisper language test. Set MLXAUDIO_ENABLE_NETWORK_TESTS=1 to enable.")
+            return
+        }
+
+        let repo = env["MLXAUDIO_WHISPER_REPO"] ?? "openai/whisper-tiny"
+        let model = try await WhisperModel.fromPretrained(repo)
+        let audio = try loadSTTNetworkFixture(sampleRate: 16000)
+
+        let languages = model.detectLanguage(audio: audio)
+
+        #expect(languages.first?.language == "en")
+        #expect(languages.map(\.probability) == languages.map(\.probability).sorted(by: >))
+        #expect(abs(languages.map(\.probability).reduce(0, +) - 1) < 0.01)
+    }
+
     @Test func whisperStreamingYieldsIncrementalTokens() async throws {
         let env = ProcessInfo.processInfo.environment
         guard env["MLXAUDIO_ENABLE_NETWORK_TESTS"] == "1" else {
