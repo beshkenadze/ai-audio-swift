@@ -2274,6 +2274,19 @@ struct ParakeetSTTTests {
         #expect(words.map { $0["start"] as? Double } == [0.0, 0.3])
     }
 
+    @Test func sentenceWordsFollowSpokenOrderWhenMergedTimesDisagree() {
+        // Merged chunks can place a later token's start before an earlier one's.
+        let sentence = ParakeetAlignedSentence(text: " Hello world", tokens: [
+            .init(id: 1, text: " Hel", start: 10.0, duration: 0.1),
+            .init(id: 2, text: "lo", start: 10.25, duration: 0.25),
+            .init(id: 3, text: " world", start: 10.125, duration: 0.25),
+        ])
+
+        #expect(sentence.words.map(\.text) == ["Hello", "world"])
+        #expect(sentence.words.map(\.start) == [10.0, 10.125])
+        #expect(sentence.words.map(\.end) == [10.5, 10.375])
+    }
+
     @Test func alignmentSentenceAndMergeUtilities() throws {
         let tokens: [ParakeetAlignedToken] = [
             .init(id: 1, text: "Hi", start: 0.0, duration: 0.2),

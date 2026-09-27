@@ -27,10 +27,13 @@ public struct NemoAlignedWord: Sendable {
 public struct NemoAlignedSentence: Sendable {
     public let text: String
     public let tokens: [NemoAlignedToken]
+    /// As spoken, which `text` follows; merged chunks can leave their times out of order.
+    private let spokenTokens: [NemoAlignedToken]
 
     public init(text: String, tokens: [NemoAlignedToken]) {
         self.text = text
         self.tokens = tokens.sorted { $0.start < $1.start }
+        self.spokenTokens = tokens
     }
 
     public var start: Double {
@@ -49,7 +52,7 @@ public struct NemoAlignedSentence: Sendable {
     /// (SentencePiece `▁`) starts a word; the rest, punctuation included, extend the current one.
     public var words: [NemoAlignedWord] {
         var groups: [[NemoAlignedToken]] = []
-        for token in tokens {
+        for token in spokenTokens {
             if token.text.hasPrefix(" ") || groups.isEmpty {
                 groups.append([token])
             } else {
@@ -58,8 +61,10 @@ public struct NemoAlignedSentence: Sendable {
         }
         return groups.compactMap { group in
             let text = group.map(\.text).joined().trimmingCharacters(in: .whitespaces)
-            guard !text.isEmpty, let first = group.first, let last = group.last else { return nil }
-            return NemoAlignedWord(text: text, start: first.start, end: last.end)
+            guard !text.isEmpty, let start = group.map(\.start).min(), let end = group.map(\.end).max() else {
+                return nil
+            }
+            return NemoAlignedWord(text: text, start: start, end: end)
         }
     }
 }
