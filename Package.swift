@@ -32,6 +32,9 @@ let package = Package(
         // Grapheme-to-Phoneme (neural ByT5 + dictionary lexicons)
         .library(name: "MLXAudioG2P", targets: ["MLXAudioG2P"]),
 
+        // Text-to-Music
+        .library(name: "MLXAudioMusic", targets: ["MLXAudioMusic"]),
+
         // Legacy combined library (for backwards compatibility)
         .library(
             name: "MLXAudio",
@@ -60,6 +63,10 @@ let package = Package(
         .executable(
             name: "mlx-audio-swift-diar",
             targets: ["mlx-audio-swift-diar"],
+        ),
+        .executable(
+            name: "mlx-audio-swift-music",
+            targets: ["mlx-audio-swift-music"],
         ),
 
     ],
@@ -240,6 +247,23 @@ let package = Package(
             path: "Sources/MLXAudioUI"
         ),
         
+        // MARK: - MLXAudioMusic
+        .target(
+            name: "MLXAudioMusic",
+            dependencies: [
+                "MLXAudioCore",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXFast", package: "mlx-swift"),
+            ],
+            path: "Sources/MLXAudioMusic"
+        ),
+
+        .executableTarget(
+            name: "mlx-audio-swift-music",
+            dependencies: ["MLXAudioMusic"],
+            path: "Sources/Tools/mlx-audio-swift-music"
+        ),
         .executableTarget(
             name: "mlx-audio-swift-tts",
             dependencies: ["MLXAudioCore", "MLXAudioTTS", "MLXAudioSTT"],
@@ -302,6 +326,7 @@ let package = Package(
                 "MLXAudioLID",
                 "mlx-audio-swift-lid",
                 "MLXAudioG2P",
+                "MLXAudioMusic",
             ],
             path: "Tests",
             resources: [
