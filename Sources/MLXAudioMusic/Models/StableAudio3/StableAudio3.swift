@@ -53,8 +53,11 @@ public struct StableAudio3 {
     }
 
     /// Stereo audio `[2, samples]` at 44.1 kHz, float32, trimmed to `request.seconds`.
+    ///
+    /// `onAudio` receives the audio in order as the decoder produces it, so a caller can
+    /// write or play the start before decoding ends; the pieces concatenate to the result.
     public func generate(
-        _ request: Request, progress: (Stage) -> Void = { _ in }
+        _ request: Request, progress: (Stage) -> Void = { _ in }, onAudio: (MLXArray) -> Void = { _ in }
     ) throws -> MLXArray {
         let latentLength = Self.latentLength(seconds: request.seconds)
 
@@ -87,11 +90,24 @@ public struct StableAudio3 {
         return try autoreleasedStage {
             let weights = try url(variant.decoderWeights)
             let latents = latents.asType(.float32)
-            let patches = switch variant {
-            case .smallMusic: try Self.loadDecoder(weights).decode(latents)
-            case .medium: try Self.loadMediumDecoder(weights).decode(latents)
+            let total = Self.sampleCount(seconds: request.seconds)
+            var pieces: [MLXArray] = []
+            var written = 0
+            func emit(_ patches: MLXArray) {
+                let audio = Self.unpatch(patches)[0]
+                let count = min(audio.dim(1), total - written)
+                guard count > 0 else { return }
+                let piece = audio[0..., ..<count]
+                eval(piece)
+                pieces.append(piece)
+                written += count
+                onAudio(piece)
             }
-            let audio = Self.unpatch(patches)[0, 0..., ..<Self.sampleCount(seconds: request.seconds)]
+            switch variant {
+            case .smallMusic: _ = try Self.loadDecoder(weights).decode(latents, onPiece: emit)
+            case .medium: _ = try Self.loadMediumDecoder(weights).decode(latents, onPiece: emit)
+            }
+            let audio = concatenated(pieces, axis: 1)
             eval(audio)
             return audio
         }

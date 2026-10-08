@@ -49,6 +49,18 @@ struct StableAudio3ScheduleTests {
         #expect(allClose(decoder.decode(latents), expected).item(Bool.self))
     }
 
+    /// What streaming relies on: every window is handed over as it is decoded, in
+    /// order, and the windows add up to exactly the whole decode.
+    @Test(arguments: [1, 5, 11, 12, 13, 20])
+    func decoderHandsOverEachWindowInOrder(length: Int) {
+        let decoder = SAMESDecoder()
+        let latents = MLXRandom.normal([1, SAMESDecoder.latentChannels, length], key: MLXRandom.key(5))
+        var pieces: [MLXArray] = []
+        let patches = decoder.decode(latents) { pieces.append($0) }
+        #expect((pieces.count > 1) == (length == 11 || length > 12), "windowed lengths arrive window by window")
+        #expect(allClose(concatenated(pieces, axis: -1), patches).item(Bool.self))
+    }
+
     @Test func unpatchInterleavesPatchesPerChannel() {
         // Two channels × patch size 2 × length 3; channel c, sample h of patch l = 100c + 10l + h.
         var values: [Float] = []
@@ -171,7 +183,11 @@ struct StableAudio3ParityTests {
 
     @Test func endToEndAudioMatches() throws {
         let model = StableAudio3(variant: variant, weightsDirectory: weights)
-        let audio = try model.generate(.init(prompt: prompt, seconds: seconds, seed: seed))
+        var pieces: [MLXArray] = []
+        let audio = try model.generate(.init(prompt: prompt, seconds: seconds, seed: seed),
+                                       onAudio: { pieces.append($0) })
+        #expect(arrayEqual(concatenated(pieces, axis: 1), audio).item(Bool.self),
+                "the streamed pieces must be the returned audio")
         let reference = try ref("audio")[0]
         #expect(audio.shape == reference.shape)
         let difference = maxDifference(audio, reference)

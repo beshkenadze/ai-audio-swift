@@ -87,23 +87,37 @@ struct CLI {
     }
 }
 
-/// 16-bit PCM WAV: clipped to [-1, 1] and truncated, like the reference writer.
-func writeWAV(_ audio: MLXArray, sampleRate: Int, to url: URL) throws {
-    let channels = audio.dim(0)
-    let interleaved = clip(audio, min: -1, max: 1).transposed(1, 0).flattened() * 32767
-    let samples = interleaved.asType(.int16).asArray(Int16.self)
-    var data = Data()
-    func append<T: FixedWidthInteger>(_ value: T) {
-        withUnsafeBytes(of: value.littleEndian) { data.append(contentsOf: $0) }
+/// 16-bit PCM WAV written as the audio arrives. The canonical 44-byte header carries
+/// the full length up front, so a reader can play the frames already on disk.
+final class WAVWriter {
+    private let handle: FileHandle
+
+    init(url: URL, channels: Int, sampleRate: Int, frames: Int) throws {
+        guard FileManager.default.createFile(atPath: url.path, contents: nil) else {
+            throw CocoaError(.fileWriteUnknown, userInfo: [NSFilePathErrorKey: url.path])
+        }
+        handle = try FileHandle(forWritingTo: url)
+        var data = Data()
+        func append<T: FixedWidthInteger>(_ value: T) {
+            withUnsafeBytes(of: value.littleEndian) { data.append(contentsOf: $0) }
+        }
+        let bytes = frames * channels * 2
+        data.append(contentsOf: "RIFF".utf8); append(UInt32(36 + bytes))
+        data.append(contentsOf: "WAVEfmt ".utf8); append(UInt32(16)); append(UInt16(1))
+        append(UInt16(channels)); append(UInt32(sampleRate))
+        append(UInt32(sampleRate * channels * 2)); append(UInt16(channels * 2)); append(UInt16(16))
+        data.append(contentsOf: "data".utf8); append(UInt32(bytes))
+        try handle.write(contentsOf: data)
     }
-    let bytes = samples.count * 2
-    data.append(contentsOf: "RIFF".utf8); append(UInt32(36 + bytes))
-    data.append(contentsOf: "WAVEfmt ".utf8); append(UInt32(16)); append(UInt16(1))
-    append(UInt16(channels)); append(UInt32(sampleRate))
-    append(UInt32(sampleRate * channels * 2)); append(UInt16(channels * 2)); append(UInt16(16))
-    data.append(contentsOf: "data".utf8); append(UInt32(bytes))
-    samples.withUnsafeBufferPointer { data.append(UnsafeBufferPointer(start: $0.baseAddress, count: $0.count)) }
-    try data.write(to: url)
+
+    /// Clipped to [-1, 1] and truncated, like the reference writer.
+    func append(_ audio: MLXArray) throws {
+        let interleaved = clip(audio, min: -1, max: 1).transposed(1, 0).flattened() * 32767
+        let samples = interleaved.asType(.int16).asArray(Int16.self)
+        try samples.withUnsafeBufferPointer { try handle.write(contentsOf: Data(buffer: $0)) }
+    }
+
+    func close() throws { try handle.close() }
 }
 
 @main
@@ -113,16 +127,24 @@ enum App {
             let cli = try CLI.parse(Array(CommandLine.arguments.dropFirst()))
             let model = StableAudio3(variant: cli.variant, weightsDirectory: cli.weights!)
             let started = Date()
+            let writer = try WAVWriter(url: cli.output!, channels: 2, sampleRate: StableAudio3.sampleRate,
+                                       frames: StableAudio3.sampleCount(seconds: cli.seconds))
+            var writeError: Error?
             let audio = try model.generate(
-                .init(prompt: cli.prompt!, seconds: cli.seconds, seed: cli.seed, steps: cli.steps)
-            ) { stage in
-                switch stage {
-                case .encodingText: print("text encoder")
-                case .sampling(let step, let total): print("sample \(step)/\(total)")
-                case .decoding: print("decoder")
-                }
-            }
-            try writeWAV(audio, sampleRate: StableAudio3.sampleRate, to: cli.output!)
+                .init(prompt: cli.prompt!, seconds: cli.seconds, seed: cli.seed, steps: cli.steps),
+                progress: { stage in
+                    switch stage {
+                    case .encodingText: print("text encoder")
+                    case .sampling(let step, let total): print("sample \(step)/\(total)")
+                    case .decoding: print("decoder")
+                    }
+                },
+                onAudio: { piece in
+                    guard writeError == nil else { return }
+                    do { try writer.append(piece) } catch { writeError = error }
+                })
+            if let writeError { throw writeError }
+            try writer.close()
             let wall = Date().timeIntervalSince(started)
             let peak = Double(Memory.peakMemory) / 1_073_741_824
             print(String(format: "done %.2fs wall  %.1fs audio  peak %.2f GB  seed %llu",
