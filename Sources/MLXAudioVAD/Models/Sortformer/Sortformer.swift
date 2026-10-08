@@ -571,19 +571,19 @@ public class SortformerModel: Module {
     /// For medium clips you already hold in memory, prefer `generateStream(audio:)`; for
     /// long/streaming/unknown-length audio, use `generateStreamBounded(audioSource:)`.
     public func generate(
-        audio: MLXArray,
+        audio: sending MLXArray,
         sampleRate: Int = 16000,
         threshold: Float = 0.5,
         minDuration: Float = 0.0,
         mergeGap: Float = 0.0,
         verbose: Bool = false
-    ) async throws -> DiarizationOutput {
+    ) async throws -> sending DiarizationOutput {
         let sendableModel = UncheckedSendableBox(self)
-        let sendableAudio = UncheckedSendableBox(audio)
+        let sendableAudio = SendingBox(audio)
         return try await withCheckedThrowingContinuation { continuation in
             Task.detached {
                 let model = sendableModel.value
-                let audio = sendableAudio.value
+                let audio = sendableAudio.take()
                 let startTime = CFAbsoluteTimeGetCurrent()
                 let proc = model.config.processorConfig
 
@@ -663,11 +663,15 @@ public class SortformerModel: Module {
     // MARK: - Streaming API
 
     public func initStreamingState() -> StreamingState {
+        StreamingState(makeInitialStreamingState())
+    }
+
+    private func makeInitialStreamingState() -> sending SortformerStreamingState {
         let embDim = config.fcEncoderConfig.hiddenSize
         let nSpk = config.modulesConfig.numSpeakers
         let emptyEmb = MLXArray.zeros([1, 0, embDim])
         let emptyPred = MLXArray.zeros([1, 0, nSpk])
-        return StreamingState(
+        return SortformerStreamingState(
             spkcache: emptyEmb,
             spkcachePreds: emptyPred,
             fifo: emptyEmb,
@@ -678,13 +682,29 @@ public class SortformerModel: Module {
         )
     }
 
-    /// Process one chunk of mel features through the streaming pipeline.
+    /// Process one chunk of mel features, consuming the state handle once.
+    /// Throws `StreamingState.ConsumptionError.alreadyConsumed` on handle reuse.
     public func streamingStep(
         chunkFeatures: MLXArray,
         chunkLength: MLXArray,
         state: StreamingState,
         rightContextEmbs: MLXArray? = nil
-    ) -> (MLXArray, StreamingState) {
+    ) throws -> (MLXArray, StreamingState) {
+        let tensors = try state.take()
+        let (predictions, nextState) = streamingStep(
+            chunkFeatures: chunkFeatures, chunkLength: chunkLength,
+            state: tensors, rightContextEmbs: rightContextEmbs)
+        let handle = Self.makeStateHandle(nextState)
+        eval(predictions)
+        return (predictions, handle)
+    }
+
+    private func streamingStep(
+        chunkFeatures: MLXArray,
+        chunkLength: MLXArray,
+        state: SortformerStreamingState,
+        rightContextEmbs: MLXArray? = nil
+    ) -> (MLXArray, SortformerStreamingState) {
         // Pre-encode chunk through ConvSubsampling
         let chunkFeat = chunkFeatures.asType(modelDtype)
         var (chunkEmbs, chunkEmbLengths) = fcEncoder.preEncode(chunkFeat, length: chunkLength)
@@ -706,9 +726,9 @@ public class SortformerModel: Module {
     func streamingStepFromEmbeddings(
         chunkEmbs: MLXArray,
         chunkDiarLen: Int,
-        state: StreamingState,
+        state: SortformerStreamingState,
         rightContextEmbs: MLXArray? = nil
-    ) -> (MLXArray, StreamingState) {
+    ) -> (MLXArray, SortformerStreamingState) {
         let mc = config.modulesConfig
         let useContext = mc.useAosc
         let lc = useContext ? mc.chunkLeftContext : 0
@@ -770,9 +790,10 @@ public class SortformerModel: Module {
         return (chunkPreds[0], newState)
     }
 
-    /// Single-chunk live streaming API: feed one audio chunk plus the carried `StreamingState` and
-    /// get this chunk's diarization output and the updated state. The caller owns chunking and state
-    /// threading; the D1 FIFO cap (`maybeCompressState`) bounds `spkcache`/`fifo` here too.
+    /// Single-chunk live streaming API: feed one audio chunk, consuming the state handle once
+    /// and returning a fresh handle for the next chunk. The caller owns chunking; model access
+    /// must remain serialized. The D1 FIFO cap (`maybeCompressState`) bounds `spkcache`/`fifo` here too.
+    /// Throws `StreamingState.ConsumptionError.alreadyConsumed` on handle reuse.
     public func feed(
         chunk: MLXArray,
         state: StreamingState,
@@ -782,80 +803,83 @@ public class SortformerModel: Module {
         mergeGap: Float = 0.0,
         spkcacheMax: Int = 188,
         fifoMax: Int = 188
-    ) async throws -> (DiarizationOutput, StreamingState) {
+    ) async throws -> sending (DiarizationOutput, StreamingState) {
         let sendableModel = UncheckedSendableBox(self)
         let sendableChunk = UncheckedSendableBox(chunk)
-        let sendableState = UncheckedSendableBox(state)
         return try await withCheckedThrowingContinuation { continuation in
             Task.detached {
-                let model = sendableModel.value
-                let chunk = sendableChunk.value
-                let state = sendableState.value
-                let proc = model.config.processorConfig
-                let subsamplingFactor = model.config.fcEncoderConfig.subsamplingFactor
-                let frameDuration = Float(proc.hopLength * subsamplingFactor) / Float(proc.samplingRate)
+                do {
+                    let model = sendableModel.value
+                    let chunk = sendableChunk.value
+                    let state = try state.take()
+                    let proc = model.config.processorConfig
+                    let subsamplingFactor = model.config.fcEncoderConfig.subsamplingFactor
+                    let frameDuration = Float(proc.hopLength * subsamplingFactor) / Float(proc.samplingRate)
 
-                var chunkMx = chunk.asType(.float32)
-                if chunkMx.ndim > 1 {
-                    chunkMx = MLX.mean(chunkMx, axis: -1)
-                }
+                    var chunkMx = chunk.asType(.float32)
+                    if chunkMx.ndim > 1 {
+                        chunkMx = MLX.mean(chunkMx, axis: -1)
+                    }
 
-                let chunkTimeOffset = Float(state.framesProcessed) * frameDuration
+                    let chunkTimeOffset = Float(state.framesProcessed) * frameDuration
 
-                let useV2Feats = model.config.modulesConfig.useAosc
-                if !useV2Feats {
-                    chunkMx = (1.0 / (MLX.abs(chunkMx).max() + 1e-3)) * chunkMx
-                }
+                    let useV2Feats = model.config.modulesConfig.useAosc
+                    if !useV2Feats {
+                        chunkMx = (1.0 / (MLX.abs(chunkMx).max() + 1e-3)) * chunkMx
+                    }
 
-                let features = extractMelFeatures(
-                    chunkMx,
-                    sampleRate: proc.samplingRate,
-                    nFft: proc.nFft,
-                    hopLength: proc.hopLength,
-                    winLength: proc.winLength,
-                    nMels: proc.featureSize,
-                    preemphasisCoeff: proc.preemphasis,
-                    normalize: useV2Feats ? nil : "per_feature",
-                    padTo: 0
-                )
-                let featureLengths = MLXArray([Int32(features.dim(2))])
-
-                var (chunkPreds, newState) = model.streamingStep(
-                    chunkFeatures: features,
-                    chunkLength: featureLengths,
-                    state: state
-                )
-
-                var segments = Self.predsToSegments(
-                    chunkPreds,
-                    frameDuration: frameDuration,
-                    threshold: threshold,
-                    minDuration: minDuration,
-                    mergeGap: mergeGap
-                )
-
-                segments = segments.map {
-                    DiarizationSegment(
-                        start: $0.start + chunkTimeOffset,
-                        end: $0.end + chunkTimeOffset,
-                        speaker: $0.speaker
+                    let features = extractMelFeatures(
+                        chunkMx,
+                        sampleRate: proc.samplingRate,
+                        nFft: proc.nFft,
+                        hopLength: proc.hopLength,
+                        winLength: proc.winLength,
+                        nMels: proc.featureSize,
+                        preemphasisCoeff: proc.preemphasis,
+                        normalize: useV2Feats ? nil : "per_feature",
+                        padTo: 0
                     )
+                    let featureLengths = MLXArray([Int32(features.dim(2))])
+
+                    var (chunkPreds, newState) = model.streamingStep(
+                        chunkFeatures: features,
+                        chunkLength: featureLengths,
+                        state: state
+                    )
+
+                    var segments = Self.predsToSegments(
+                        chunkPreds,
+                        frameDuration: frameDuration,
+                        threshold: threshold,
+                        minDuration: minDuration,
+                        mergeGap: mergeGap
+                    )
+
+                    segments = segments.map {
+                        DiarizationSegment(
+                            start: $0.start + chunkTimeOffset,
+                            end: $0.end + chunkTimeOffset,
+                            speaker: $0.speaker
+                        )
+                    }
+
+                    newState = Self.maybeCompressState(
+                        newState,
+                        spkcacheMax: spkcacheMax,
+                        fifoMax: fifoMax,
+                        modulesCfg: model.config.modulesConfig
+                    )
+
+                    let activeSpeakers = Set(segments.map { $0.speaker })
+                    let output = DiarizationOutput(
+                        segments: segments,
+                        speakerProbs: chunkPreds,
+                        numSpeakers: activeSpeakers.count
+                    )
+                    continuation.resume(returning: (output, Self.makeStateHandle(newState)))
+                } catch {
+                    continuation.resume(throwing: error)
                 }
-
-                newState = Self.maybeCompressState(
-                    newState,
-                    spkcacheMax: spkcacheMax,
-                    fifoMax: fifoMax,
-                    modulesCfg: model.config.modulesConfig
-                )
-
-                let activeSpeakers = Set(segments.map { $0.speaker })
-                let output = DiarizationOutput(
-                    segments: segments,
-                    speakerProbs: chunkPreds,
-                    numSpeakers: activeSpeakers.count
-                )
-                continuation.resume(returning: (output, newState))
             }
         }
     }
@@ -873,7 +897,7 @@ public class SortformerModel: Module {
     /// streaming paths — but the whole-file precompute remains the duration-scaling cost. For
     /// long/streaming/unknown-length audio use `generateStreamBounded(audioSource:)` instead.
     public func generateStream(
-        audio: MLXArray,
+        audio: sending MLXArray,
         sampleRate: Int = 16000,
         chunkDuration: Float = 5.0,
         threshold: Float = 0.5,
@@ -882,13 +906,13 @@ public class SortformerModel: Module {
         spkcacheMax: Int = 188,
         fifoMax: Int = 188,
         verbose: Bool = false
-    ) -> AsyncThrowingStream<DiarizationOutput, Error> {
+    ) -> sending AsyncThrowingStream<DiarizationOutput, Error> {
         let sendableModel = UncheckedSendableBox(self)
-        let sendableAudio = UncheckedSendableBox(audio)
-        return AsyncThrowingStream { continuation in
-            Task.detached {
+        let sendableAudio = SendingBox(audio)
+        return AsyncThrowingStream { @Sendable continuation in
+            let task = Task.detached {
                 let model = sendableModel.value
-                let audio = sendableAudio.value
+                let audio = sendableAudio.take()
                 let proc = model.config.processorConfig
                 let mc = model.config.modulesConfig
 
@@ -943,13 +967,16 @@ public class SortformerModel: Module {
                     print("Streaming: \(String(format: "%.2f", audioDur))s audio in \(nChunks) chunks (\(String(format: "%.1f", chunkDuration))s each)")
                 }
 
-                var state = model.initStreamingState()
+                var state = model.makeInitialStreamingState()
                 var offsetMel = 0
                 var chunkIdx = 0
                 var embOffset = 0
 
                 while offsetMel < totalMelFrames {
-                    try Task.checkCancellation()
+                    guard !Task.isCancelled else {
+                        continuation.finish(throwing: CancellationError())
+                        return
+                    }
 
                     let endMel = min(offsetMel + chunkMel, totalMelFrames)
                     let chunkFeat = features[0..., 0..., offsetMel..<endMel]
@@ -1007,11 +1034,15 @@ public class SortformerModel: Module {
                         print("  Chunk \(chunkIdx): \(String(format: "%.2f", t0))s-\(String(format: "%.2f", t1))s  \(segments.count) segments, context=\(state.spkcacheLen)+\(state.fifoLen) frames")
                     }
 
-                    continuation.yield(DiarizationOutput(
+                    // streamingStep evaluates the predictions and builds separate
+                    // state tensors. The producer no longer accesses this output;
+                    // MLX's view operations don't express that independence to Swift.
+                    nonisolated(unsafe) let output = DiarizationOutput(
                         segments: segments,
                         speakerProbs: chunkPreds,
                         numSpeakers: activeSpeakers.count
-                    ))
+                    )
+                    continuation.yield(output)
 
                     state = Self.maybeCompressState(
                         state,
@@ -1025,6 +1056,7 @@ public class SortformerModel: Module {
 
                 continuation.finish()
             }
+            continuation.onTermination = { @Sendable _ in task.cancel() }
         }
     }
 
@@ -1133,7 +1165,7 @@ public class SortformerModel: Module {
 
                 do {
                     var acc = PCMAccumulator()
-                    var state = model.initStreamingState()
+                    var state = model.makeInitialStreamingState()
                     var g0 = 0                  // global mel index of the first NEW frame this step
                     var globalDiarFrame = 0     // emitted emb frames so far (time offset accumulator)
                     var eof = false
@@ -1243,11 +1275,14 @@ public class SortformerModel: Module {
                         }
 
                         let activeSpeakers = Set(segments.map { $0.speaker })
-                        continuation.yield(DiarizationOutput(
+                        // predsToSegments has read chunkPreds back, so it is evaluated, and the
+                        // producer does not touch it after this point (see generateStream).
+                        nonisolated(unsafe) let output = DiarizationOutput(
                             segments: segments,
                             speakerProbs: chunkPreds,
                             numSpeakers: activeSpeakers.count
-                        ))
+                        )
+                        continuation.yield(output)
 
                         // 8. Cap state (D1 true cap). Force-evaluate per-step tensors + state arrays
                         //    so the lazy graph cannot grow across steps (flat memory).
@@ -1258,7 +1293,6 @@ public class SortformerModel: Module {
                             modulesCfg: mc
                         )
                         MLX.eval(
-                            chunkPreds,
                             state.spkcache, state.spkcachePreds,
                             state.fifo, state.fifoPreds,
                             state.meanSilEmb, state.nSilFrames
@@ -1287,13 +1321,24 @@ public class SortformerModel: Module {
 
     // MARK: - State Management
 
+    /// Called when the worker is done with this state and all its tensor aliases.
+    private static func makeStateHandle(_ state: SortformerStreamingState) -> StreamingState {
+        eval(state.spkcache, state.spkcachePreds, state.fifo, state.fifoPreds,
+             state.meanSilEmb, state.nSilFrames)
+        // MLX operations merge state with the model's region in Swift's analysis.
+        // These evaluated tensors are retained only by this continuation, not by
+        // the model. No worker accesses them after handing off the handle.
+        nonisolated(unsafe) let ownedState = state
+        return StreamingState(ownedState)
+    }
+
     private static func updateStreamingState(
-        _ state: StreamingState,
+        _ state: SortformerStreamingState,
         chunkEmbs: MLXArray,
         chunkPreds: MLXArray,
         updatedCachePreds: MLXArray,
         updatedFifoPreds: MLXArray
-    ) -> StreamingState {
+    ) -> SortformerStreamingState {
         let spkcache = state.spkcache
         let spkcachePreds = state.spkcacheLen > 0 ? updatedCachePreds : state.spkcachePreds
         let fifoPreds = state.fifoLen > 0 ? updatedFifoPreds : state.fifoPreds
@@ -1302,7 +1347,7 @@ public class SortformerModel: Module {
         let newFifoPreds = MLX.concatenated([fifoPreds, chunkPreds], axis: 1)
         eval(newFifo, newFifoPreds)
 
-        return StreamingState(
+        return SortformerStreamingState(
             spkcache: spkcache,
             spkcachePreds: spkcachePreds,
             fifo: newFifo,
@@ -1314,11 +1359,11 @@ public class SortformerModel: Module {
     }
 
     static func maybeCompressState(
-        _ state: StreamingState,
+        _ state: SortformerStreamingState,
         spkcacheMax: Int,
         fifoMax: Int,
         modulesCfg: ModulesConfig
-    ) -> StreamingState {
+    ) -> SortformerStreamingState {
         // Loop the pop/compress until the FIFO is within bound. A single chunk may emit
         // more than `spkcacheUpdatePeriod` embedding frames; `compressOnce` pops at most one
         // period (preserving AOSC per-period semantics), so capping requires repeated passes.
@@ -1332,11 +1377,11 @@ public class SortformerModel: Module {
     }
 
     private static func compressOnce(
-        _ state: StreamingState,
+        _ state: SortformerStreamingState,
         spkcacheMax: Int,
         fifoMax: Int,
         modulesCfg: ModulesConfig
-    ) -> StreamingState {
+    ) -> SortformerStreamingState {
         let useAosc = modulesCfg.useAosc
 
         var popLen = state.fifoLen - fifoMax
@@ -1384,7 +1429,7 @@ public class SortformerModel: Module {
 
         eval(newCache, newCachePreds, newFifo, newFifoPreds, meanSilEmb, nSilFrames)
 
-        return StreamingState(
+        return SortformerStreamingState(
             spkcache: newCache,
             spkcachePreds: newCachePreds,
             fifo: newFifo,
