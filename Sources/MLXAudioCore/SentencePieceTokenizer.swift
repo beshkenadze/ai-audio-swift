@@ -108,12 +108,14 @@ struct SentencePieceModelParser {
     static func parsePieces(from data: Data) throws -> (
         pieces: [SentencePieceToken],
         unknownTokenId: Int,
-        modelType: SentencePieceModelType
+        modelType: SentencePieceModelType,
+        addDummyPrefix: Bool
     ) {
         var reader = SentencePieceProtobufReader(data)
         var pieces: [SentencePieceToken] = []
         var unknownTokenId: Int?
         var modelType: SentencePieceModelType = .unigram
+        var addDummyPrefix = true
 
         while !reader.isAtEnd {
             let key = try reader.readVarint()
@@ -131,6 +133,9 @@ struct SentencePieceModelParser {
             } else if fieldNumber == 2, wireType == 2 {
                 let trainerSpecData = try reader.readLengthDelimited()
                 modelType = try parseTrainerSpecModelType(from: trainerSpecData) ?? modelType
+            } else if fieldNumber == 3, wireType == 2 {
+                let normalizerSpecData = try reader.readLengthDelimited()
+                addDummyPrefix = try parseNormalizerSpecAddDummyPrefix(from: normalizerSpecData) ?? addDummyPrefix
             } else {
                 try reader.skipField(wireType: wireType)
             }
@@ -143,7 +148,7 @@ struct SentencePieceModelParser {
         let resolvedUnknownId = unknownTokenId
             ?? pieces.firstIndex(where: { $0.token == "<unk>" })
             ?? 0
-        return (pieces, resolvedUnknownId, modelType)
+        return (pieces, resolvedUnknownId, modelType, addDummyPrefix)
     }
 
     private static func parsePiece(from data: Data) throws -> SentencePieceToken? {
@@ -173,6 +178,22 @@ struct SentencePieceModelParser {
 
         guard let token else { return nil }
         return SentencePieceToken(token: token, score: score, type: type)
+    }
+
+    /// `NormalizerSpec.add_dummy_prefix` (field 3); Gemma's tokenizer turns it off.
+    private static func parseNormalizerSpecAddDummyPrefix(from data: Data) throws -> Bool? {
+        var reader = SentencePieceProtobufReader(data)
+        while !reader.isAtEnd {
+            let key = try reader.readVarint()
+            let fieldNumber = Int(key >> 3)
+            let wireType = key & 0x7
+
+            if fieldNumber == 3, wireType == 0 {
+                return try reader.readVarint() != 0
+            }
+            try reader.skipField(wireType: wireType)
+        }
+        return nil
     }
 
     private static func parseTrainerSpecModelType(from data: Data) throws -> SentencePieceModelType? {
@@ -382,17 +403,20 @@ public final class SentencePieceTokenizer {
     let unknownTokenId: Int
     let unknownTokenScore: Float
     let modelType: SentencePieceModelType
+    let addDummyPrefix: Bool
     let tokensToIds: [String: Int]
     let trie: Trie
 
     private init(
         vocab: [SentencePieceToken],
         unknownTokenId: Int,
-        modelType: SentencePieceModelType = .unigram
+        modelType: SentencePieceModelType = .unigram,
+        addDummyPrefix: Bool = true
     ) {
         self.vocab = vocab
         self.unknownTokenId = unknownTokenId
         self.modelType = modelType
+        self.addDummyPrefix = addDummyPrefix
         let minScore = vocab.reduce(Float.greatestFiniteMagnitude) { min($0, $1.score) }
         self.unknownTokenScore = minScore - 10
 
@@ -449,7 +473,8 @@ public final class SentencePieceTokenizer {
         self.init(
             vocab: parsed.pieces,
             unknownTokenId: parsed.unknownTokenId,
-            modelType: parsed.modelType
+            modelType: parsed.modelType,
+            addDummyPrefix: parsed.addDummyPrefix
         )
     }
 
@@ -634,7 +659,7 @@ public final class SentencePieceTokenizer {
 
     private func applyMetaspace(_ text: String) -> String {
         let replaced = text.replacingOccurrences(of: " ", with: "▁")
-        return "▁" + replaced
+        return addDummyPrefix ? "▁" + replaced : replaced
     }
 }
 
