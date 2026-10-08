@@ -94,14 +94,15 @@ final class SAMEBlock: Module {
 /// Each latent expands into itself plus 16 learned tokens. The first three blocks
 /// attend within windows of 34 positions, the last three within windows shifted by
 /// half a window, so information crosses window edges.
-final class SAMESDecoder: Module {
+final class SAMESDecoder: Module, SAMEDecoding {
     static let latentChannels = 256
     static let dimensions = 768
     static let outputChannels = 512
     static let stride = 16
+    static let window = (chunk: 8, overlap: 2)
     private static let subChunk = stride + 1
-    private static let window = 32 + 32 / stride
-    private static let shift = window / 2
+    private static let attentionWindow = 32 + 32 / stride
+    private static let shift = attentionWindow / 2
 
     @ParameterInfo(key: "running_std") var runningStd: MLXArray
     @ModuleInfo(key: "project_in") var projectIn: Linear
@@ -128,53 +129,17 @@ final class SAMESDecoder: Module {
         let learned = broadcast(newTokens[.newAxis], to: [b, t, Self.stride, d])
         x = concatenated([x[0..., 0..., .newAxis, 0...], learned], axis: 2)
         let length = t * Self.subChunk
-        x = x.reshaped(b * length / Self.window, Self.window, d)
+        x = x.reshaped(b * length / Self.attentionWindow, Self.attentionWindow, d)
         for block in blocks[0..<3] { x = block(x) }
         x = x.reshaped(b, length, d)
 
         x = concatenated([x[0..., ..<Self.shift, 0...], x, x[0..., (length - Self.shift)..., 0...]], axis: 1)
-        x = x.reshaped(b * (length + Self.window) / Self.window, Self.window, d)
+        x = x.reshaped(b * (length + Self.attentionWindow) / Self.attentionWindow, Self.attentionWindow, d)
         for block in blocks[3...] { x = block(x) }
-        x = x.reshaped(b, length + Self.window, d)[0..., Self.shift..<(Self.shift + length), 0...]
+        x = x.reshaped(b, length + Self.attentionWindow, d)[0..., Self.shift..<(Self.shift + length), 0...]
 
         x = x.reshaped(b * t, Self.subChunk, d)[0..., 1..., 0...].reshaped(b, t * Self.stride, d)
         return mapping(x).transposed(0, 2, 1)
-    }
-
-    /// Any latent length, dispatched as the reference does. Every call into the
-    /// model must see an even length.
-    func decode(_ latents: MLXArray) -> MLXArray {
-        let t = latents.dim(2)
-        if t > 12 { return decodeChunked(latents, chunk: 8, overlap: 2) }
-        if t % 2 == 0 { return self(latents) }
-        if t > 6 { return decodeChunked(latents, chunk: 2, overlap: 2) }
-        // Too short and odd for any even window: repeat the last latent, then trim.
-        let even = concatenated([latents, latents[.ellipsis, (t - 1)...]], axis: -1)
-        return self(even)[.ellipsis, ..<(t * Self.stride)]
-    }
-
-    /// Decodes long latents window by window, so memory stays flat with length.
-    ///
-    /// Every call sees `chunk + 2 * overlap` real latents and keeps the middle
-    /// `chunk`; the first and last calls keep their outer edge as well.
-    func decodeChunked(_ latents: MLXArray, chunk: Int, overlap: Int) -> MLXArray {
-        let t = latents.dim(2)
-        let kernel = chunk + 2 * overlap
-        precondition(kernel % 2 == 0 && t > kernel, "SAME-S windows must be even and shorter than the input")
-        let s = Self.stride
-        var pieces = [self(latents[.ellipsis, 0..<kernel])[.ellipsis, ..<((chunk + overlap) * s)]]
-        var i = chunk + overlap
-        while i + chunk + overlap <= t {
-            let out = self(latents[.ellipsis, (i - overlap)..<(i + chunk + overlap)])
-            pieces.append(out[.ellipsis, (overlap * s)..<((overlap + chunk) * s)])
-            eval(pieces.last!)
-            i += chunk
-        }
-        let remaining = t - i
-        if remaining > 0 {
-            pieces.append(self(latents[.ellipsis, (t - kernel)..<t])[.ellipsis, ((kernel - remaining) * s)...])
-        }
-        return concatenated(pieces, axis: -1)
     }
 
     /// The decoder ships its output convolution in PyTorch layout `[out, in, k]`.

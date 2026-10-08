@@ -35,6 +35,20 @@ struct StableAudio3ScheduleTests {
         #expect(patches.shape == [1, SAMESDecoder.outputChannels, length * SAMESDecoder.stride])
     }
 
+    /// The reference pipeline (`sa3_mlx.py`) dispatches every decoder the same way:
+    /// windowed beyond one window, whole when even, 2+2 windows when odd and longer
+    /// than 6, otherwise the last latent repeated and the extra output trimmed.
+    @Test(arguments: [1, 5, 7, 9])
+    func mediumDecoderDispatchesShortOddLengthsLikeTheReference(length: Int) {
+        let decoder = SAMELDecoder()
+        let latents = MLXRandom.normal([1, SAMELDecoder.latentChannels, length], key: MLXRandom.key(3))
+        let expected = length > 6
+            ? decoder.decodeChunked(latents, chunk: 2, overlap: 2)
+            : decoder(concatenated([latents, latents[.ellipsis, (length - 1)...]], axis: -1))[
+                .ellipsis, ..<(length * SAMELDecoder.stride)]
+        #expect(allClose(decoder.decode(latents), expected).item(Bool.self))
+    }
+
     @Test func unpatchInterleavesPatchesPerChannel() {
         // Two channels × patch size 2 × length 3; channel c, sample h of patch l = 100c + 10l + h.
         var values: [Float] = []
@@ -57,12 +71,14 @@ private func stableAudio3ParityPaths() -> (weights: URL, reference: URL)? {
 /// pipeline. Needs the published weights and a reference archive:
 ///
 ///     MLXAUDIO_SA3_WEIGHTS=<dir with *.npz>  MLXAUDIO_SA3_REFERENCE=<reference.npz>
+///     MLXAUDIO_SA3_VARIANT=sm-music|medium   (default sm-music)
 ///
 /// (prefix both with `TEST_RUNNER_` under xcodebuild).
 @Suite(.serialized, .enabled(if: stableAudio3ParityPaths() != nil))
 struct StableAudio3ParityTests {
 
     let weights: URL
+    let variant: StableAudio3.Variant
     let reference: NPZArchive
     let prompt: String
     let seconds: Double
@@ -70,7 +86,11 @@ struct StableAudio3ParityTests {
 
     init() throws {
         let paths = try #require(stableAudio3ParityPaths())
+        // Earlier tests in this process leave weights in MLX's buffer cache.
+        Memory.clearCache()
         weights = paths.weights
+        variant = try #require(StableAudio3.Variant(
+            rawValue: ProcessInfo.processInfo.environment["MLXAUDIO_SA3_VARIANT"] ?? "sm-music"))
         reference = try NPZArchive(url: paths.reference)
         prompt = String(decoding: try reference.bytes("prompt"), as: UTF8.self)
         let params = try reference.array("params").asArray(Float.self)
@@ -104,7 +124,7 @@ struct StableAudio3ParityTests {
 
     @Test func conditioningMatches() throws {
         let conditioning = try StableAudio3.Conditioning(
-            npz: weights.appendingPathComponent("dit_sm-music_f16.npz"))
+            npz: weights.appendingPathComponent(variant.ditWeights))
         let (crossAttn, global) = conditioning(
             embeddings: try ref("embeds"), mask: try ref("mask"), seconds: seconds)
         #expect(maxDifference(crossAttn, try ref("cross_attn")) == 0)
@@ -119,7 +139,8 @@ struct StableAudio3ParityTests {
     }
 
     @Test func transformerAndSamplerMatch() throws {
-        let model = try StableAudio3.loadDiT(weights.appendingPathComponent("dit_sm-music_f16.npz"))
+        let model = try StableAudio3.loadDiT(
+            weights.appendingPathComponent(variant.ditWeights), config: variant.ditConfig)
         let (noise, crossAttn, global, sigmas) = (try ref("noise"), try ref("cross_attn"),
                                                   try ref("global_cond"), try ref("sigmas"))
         let v0 = model(noise, t: sigmas[0] * MLXArray.ones([1], dtype: .float16),
@@ -137,15 +158,19 @@ struct StableAudio3ParityTests {
     }
 
     @Test func decoderMatches() throws {
-        let decoder = try StableAudio3.loadDecoder(weights.appendingPathComponent("same_s_decoder_f32.npz"))
-        let patches = decoder.decode(try ref("latents").asType(.float32))
+        let url = weights.appendingPathComponent(variant.decoderWeights)
+        let latents = try ref("latents").asType(.float32)
+        let patches = switch variant {
+        case .smallMusic: try StableAudio3.loadDecoder(url).decode(latents)
+        case .medium: try StableAudio3.loadMediumDecoder(url).decode(latents)
+        }
         let difference = maxDifference(patches, try ref("patches"))
         print("SA3 parity decoder: max |Δ| \(difference)")
         #expect(difference < 1e-3)
     }
 
     @Test func endToEndAudioMatches() throws {
-        let model = StableAudio3(variant: .smallMusic, weightsDirectory: weights)
+        let model = StableAudio3(variant: variant, weightsDirectory: weights)
         let audio = try model.generate(.init(prompt: prompt, seconds: seconds, seed: seed))
         let reference = try ref("audio")[0]
         #expect(audio.shape == reference.shape)

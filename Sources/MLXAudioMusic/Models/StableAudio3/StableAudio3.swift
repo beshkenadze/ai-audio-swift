@@ -11,9 +11,11 @@ import MLXNN
 public struct StableAudio3 {
     public enum Variant: String, CaseIterable, Sendable {
         case smallMusic = "sm-music"
+        case medium
 
         var ditWeights: String { "dit_\(rawValue)_f16.npz" }
-        var decoderWeights: String { "same_s_decoder_f32.npz" }
+        var decoderWeights: String { self == .medium ? "same_l_decoder_f32.npz" : "same_s_decoder_f32.npz" }
+        var ditConfig: StableAudio3DiTConfig { self == .medium ? .medium : .smallMusic }
         static let textEncoderWeights = "t5gemma_f16.npz"
 
         /// Every file `generate` reads, relative to the weights directory.
@@ -68,9 +70,9 @@ public struct StableAudio3 {
             let dit = try url(variant.ditWeights)
             let conditioning = try Conditioning(npz: dit)
                 .callAsFunction(embeddings: embeddings, mask: mask, seconds: request.seconds)
-            let model = try Self.loadDiT(dit)
+            let model = try Self.loadDiT(dit, config: variant.ditConfig)
             let noise = MLXRandom.normal(
-                [1, StableAudio3DiTConfig.smallMusic.ioChannels, latentLength],
+                [1, variant.ditConfig.ioChannels, latentLength],
                 dtype: .float16, key: MLXRandom.key(request.seed))
             let latents = Self.sample(
                 noise: noise, sigmas: Self.schedule(steps: request.steps), seed: request.seed + 1,
@@ -83,8 +85,12 @@ public struct StableAudio3 {
 
         progress(.decoding)
         return try autoreleasedStage {
-            let decoder = try Self.loadDecoder(url(variant.decoderWeights))
-            let patches = decoder.decode(latents.asType(.float32))
+            let weights = try url(variant.decoderWeights)
+            let latents = latents.asType(.float32)
+            let patches = switch variant {
+            case .smallMusic: try Self.loadDecoder(weights).decode(latents)
+            case .medium: try Self.loadMediumDecoder(weights).decode(latents)
+            }
             let audio = Self.unpatch(patches)[0, 0..., ..<Self.sampleCount(seconds: request.seconds)]
             eval(audio)
             return audio
@@ -116,8 +122,8 @@ public struct StableAudio3 {
         return try body()
     }
 
-    static func loadDiT(_ url: URL) throws -> StableAudio3DiT {
-        let model = StableAudio3DiT(.smallMusic)
+    static func loadDiT(_ url: URL, config: StableAudio3DiTConfig = .smallMusic) throws -> StableAudio3DiT {
+        let model = StableAudio3DiT(config)
         let weights = StableAudio3DiT.sanitize(try NPZArchive(url: url).arrays { !$0.hasPrefix("cond.") })
             .mapValues { $0.asType(.float16) }
         try model.update(parameters: ModuleParameters.unflattened(weights), verify: .all)
@@ -128,6 +134,14 @@ public struct StableAudio3 {
     static func loadDecoder(_ url: URL) throws -> SAMESDecoder {
         let model = SAMESDecoder()
         let weights = SAMESDecoder.sanitize(try NPZArchive(url: url).arrays()).mapValues { $0.asType(.float32) }
+        try model.update(parameters: ModuleParameters.unflattened(weights), verify: .all)
+        eval(model.parameters())
+        return model
+    }
+
+    static func loadMediumDecoder(_ url: URL) throws -> SAMELDecoder {
+        let model = SAMELDecoder()
+        let weights = SAMELDecoder.sanitize(try NPZArchive(url: url).arrays()).mapValues { $0.asType(.float32) }
         try model.update(parameters: ModuleParameters.unflattened(weights), verify: .all)
         eval(model.parameters())
         return model

@@ -76,7 +76,7 @@ struct CLI {
 
             Options:
               --weights <dir>     Directory with t5gemma_f16.npz, dit_<variant>_f16.npz and the decoder
-              --dit <variant>     sm-music (default)
+              --dit <variant>     sm-music (default) or medium
               --prompt <text>     Text prompt
               --seconds <s>       Length in seconds. Default: 30
               --seed <n>          Random seed. Default: 0

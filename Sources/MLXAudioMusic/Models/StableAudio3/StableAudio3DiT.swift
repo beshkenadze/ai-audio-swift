@@ -17,10 +17,23 @@ struct StableAudio3DiTConfig: Sendable {
     var timestepFeatures = 256
     var normEps: Float = 1e-5
     var qkNormEps: Float = 1e-6
+    /// Medium attends twice and subtracts: `SDPA(q, k, v) - SDPA(q', k', v)`.
+    var differentialAttention = false
 
     var headDim: Int { embedDimension / heads }
 
     static let smallMusic = StableAudio3DiTConfig()
+    static let medium = StableAudio3DiTConfig(
+        embedDimension: 1536, depth: 24, heads: 24, feedForwardInner: 6144, differentialAttention: true)
+}
+
+/// `SDPA(q, k, v)`, or with `diff` the differential form `SDPA(q, k, v) - SDPA(q', k', v)`.
+func attend(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray,
+            diff: (q: MLXArray, k: MLXArray)?, scale: Float) -> MLXArray {
+    let main = MLXFast.scaledDotProductAttention(queries: q, keys: k, values: v, scale: scale, mask: nil)
+    guard let diff else { return main }
+    return main - MLXFast.scaledDotProductAttention(
+        queries: diff.q, keys: diff.k, values: v, scale: scale, mask: nil)
 }
 
 /// `Linear → SiLU → Linear`, stored upstream as a list with the activation at index 1.
@@ -49,24 +62,24 @@ final class StableAudio3SelfAttention: Module {
     init(_ config: StableAudio3DiTConfig) {
         self.config = config
         let d = config.embedDimension
-        _toQKV.wrappedValue = Linear(d, 3 * d, bias: false)
+        _toQKV.wrappedValue = Linear(d, (config.differentialAttention ? 5 : 3) * d, bias: false)
         _toOut.wrappedValue = Linear(d, d, bias: false)
         _qNorm.wrappedValue = RMSNorm(dimensions: config.headDim, eps: config.qkNormEps)
         _kNorm.wrappedValue = RMSNorm(dimensions: config.headDim, eps: config.qkNormEps)
     }
 
+    /// Packed as q, k, v and, for differential attention, q', k'.
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (b, t) = (x.dim(0), x.dim(1))
-        let parts = toQKV(x).split(parts: 3, axis: -1)
-        func heads(_ y: MLXArray) -> MLXArray {
-            y.reshaped(b, t, config.heads, config.headDim).transposed(0, 2, 1, 3)
+        let parts = toQKV(x).split(parts: config.differentialAttention ? 5 : 3, axis: -1).map {
+            $0.reshaped(b, t, config.heads, config.headDim).transposed(0, 2, 1, 3)
         }
-        let q = rope(qNorm(heads(parts[0])), config.ropeDimensions)
-        let k = rope(kNorm(heads(parts[1])), config.ropeDimensions)
-        let out = MLXFast.scaledDotProductAttention(
-            queries: q, keys: k, values: heads(parts[2]),
-            scale: pow(Float(config.headDim), -0.5), mask: nil
-        )
+        let queries = { rope(self.qNorm($0), self.config.ropeDimensions) }
+        let keys = { rope(self.kNorm($0), self.config.ropeDimensions) }
+        let out = attend(
+            queries(parts[0]), keys(parts[1]), parts[2],
+            diff: config.differentialAttention ? (queries(parts[3]), keys(parts[4])) : nil,
+            scale: pow(Float(config.headDim), -0.5))
         return toOut(out.transposed(0, 2, 1, 3).reshaped(b, t, config.embedDimension))
     }
 }
@@ -83,23 +96,27 @@ final class StableAudio3CrossAttention: Module {
     init(_ config: StableAudio3DiTConfig) {
         self.config = config
         let d = config.embedDimension
-        _toQ.wrappedValue = Linear(d, d, bias: false)
-        _toKV.wrappedValue = Linear(d, 2 * d, bias: false)
+        let differential = config.differentialAttention
+        _toQ.wrappedValue = Linear(d, (differential ? 2 : 1) * d, bias: false)
+        _toKV.wrappedValue = Linear(d, (differential ? 3 : 2) * d, bias: false)
         _toOut.wrappedValue = Linear(d, d, bias: false)
         _qNorm.wrappedValue = RMSNorm(dimensions: config.headDim, eps: config.qkNormEps)
         _kNorm.wrappedValue = RMSNorm(dimensions: config.headDim, eps: config.qkNormEps)
     }
 
+    /// No rotary embedding. Differential packing: `to_q` → q, q'; `to_kv` → k, k', v.
     func callAsFunction(_ x: MLXArray, context: MLXArray) -> MLXArray {
         let b = x.dim(0)
         func heads(_ y: MLXArray) -> MLXArray {
             y.reshaped(b, y.dim(1), config.heads, config.headDim).transposed(0, 2, 1, 3)
         }
-        let kv = toKV(context).split(parts: 2, axis: -1)
-        let out = MLXFast.scaledDotProductAttention(
-            queries: qNorm(heads(toQ(x))), keys: kNorm(heads(kv[0])), values: heads(kv[1]),
-            scale: pow(Float(config.headDim), -0.5), mask: nil
-        )
+        let differential = config.differentialAttention
+        let q = toQ(x).split(parts: differential ? 2 : 1, axis: -1).map { qNorm(heads($0)) }
+        let kv = toKV(context).split(parts: differential ? 3 : 2, axis: -1).map(heads)
+        let out = attend(
+            q[0], kNorm(kv[0]), kv[differential ? 2 : 1],
+            diff: differential ? (q[1], kNorm(kv[1])) : nil,
+            scale: pow(Float(config.headDim), -0.5))
         return toOut(out.transposed(0, 2, 1, 3).reshaped(b, x.dim(1), config.embedDimension))
     }
 }
@@ -193,6 +210,8 @@ final class StableAudio3ContinuousTransformer: Module {
             let padding = MLXArray.zeros([b, config.memoryTokens, config.embedDimension], dtype: local.dtype)
             x = layer(x, context: context, globalCond: g,
                       localEmbedding: concatenated([padding, local], axis: 1))
+            // One block's intermediates at a time instead of the whole graph's.
+            eval(x)
         }
         return projectOut(x[0..., config.memoryTokens..., 0...])
     }
