@@ -218,7 +218,8 @@ public final class StableAudio3TextEncoder {
         let config = try JSONDecoder().decode(T5GemmaEncoderConfig.self, from: archive.bytes("META"))
         tokenizer = try SentencePieceTokenizer(sentencePieceModelData: archive.bytes("TOKENIZER_MODEL"))
         encoder = T5GemmaEncoder(config)
-        let weights = try archive.arrays { $0 != "META" && $0 != "TOKENIZER_MODEL" }
+        let weights = try archive.arrays { $0 != "META" && $0 != "TOKENIZER_MODEL" && $0 != "QUANTIZATION" }
+        try StableAudio3Quantization.prepare(encoder, archive: archive, weights: weights)
         try encoder.update(parameters: ModuleParameters.unflattened(weights), verify: .all)
         eval(encoder.parameters())
     }

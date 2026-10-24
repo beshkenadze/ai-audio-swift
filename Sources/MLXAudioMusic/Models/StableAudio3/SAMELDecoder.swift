@@ -86,7 +86,8 @@ final class SAMELDifferentialAttention: Module {
 }
 
 final class SAMELFeedForward: Module {
-    let sineGate: Bool
+    /// Not a weight: a streamed block module is reused for both kinds of block.
+    var sineGate: Bool
 
     @ModuleInfo(key: "glu_proj") var gluProj: Linear
     @ModuleInfo(key: "proj_out") var projOut: Linear
@@ -119,6 +120,8 @@ final class SAMELBlock: Module {
 
     func callAsFunction(_ x: MLXArray, band: MLXArray) -> MLXArray {
         let x = x + attention(preNorm(x), band: band)
+        // Frees the attention's windowed copies before the feed-forward allocates.
+        eval(x)
         return x + ff(ffNorm(x))
     }
 }
@@ -139,30 +142,83 @@ final class SAMELDecoder: Module, SAMEDecoding {
     @ModuleInfo(key: "blocks") var blocks: [SAMELBlock]
     @ModuleInfo(key: "mapping") var mapping: Linear
 
-    override init() {
+    static let depth = 12
+    static func sineGate(block: Int) -> Bool { block >= 5 }
+
+    /// `streamsBlocks` leaves `blocks` empty; decode with ``decode(_:blocks:onPiece:)``.
+    init(streamsBlocks: Bool = false) {
         let d = Self.dimensions
         _runningStd.wrappedValue = MLXArray.ones([1])
         _projectIn.wrappedValue = Linear(Self.latentChannels, d, bias: true)
         _newTokens.wrappedValue = MLXArray.zeros([1, 1, d])
-        _blocks.wrappedValue = (0..<12).map { SAMELBlock(dimensions: d, sineGate: $0 >= 5) }
+        _blocks.wrappedValue = streamsBlocks
+            ? [] : (0..<Self.depth).map { SAMELBlock(dimensions: d, sineGate: Self.sineGate(block: $0)) }
         _mapping.wrappedValue = Linear(d, Self.outputChannels, bias: true)
     }
 
     func callAsFunction(_ latents: MLXArray) -> MLXArray {
-        let (b, t) = (latents.dim(0), latents.dim(2))
-        let d = Self.dimensions
-        var x = projectIn((latents * runningStd).transposed(0, 2, 1))
-        let learned = broadcast(newTokens[.newAxis], to: [b, t, Self.stride, d])
-        x = concatenated([x[0..., 0..., .newAxis, 0...], learned], axis: 2)
-            .reshaped(b, t * (Self.stride + 1), d)
-
+        precondition(blocks.count == Self.depth, "a streaming decoder decodes with its block stream")
+        var x = embed(latents)
         let band = SAMELDifferentialAttention.band(dtype: x.dtype)
         for block in blocks {
             x = block(x, band: band)
             eval(x)
         }
-        x = x.reshaped(b, t, Self.stride + 1, d)[0..., 0..., 1..., 0...].reshaped(b, t * Self.stride, d)
+        return project(x)
+    }
+
+    /// Each latent, then its 16 learned tokens: `[B, 17 T, d]`.
+    private func embed(_ latents: MLXArray) -> MLXArray {
+        let (b, t) = (latents.dim(0), latents.dim(2))
+        let d = Self.dimensions
+        let x = projectIn((latents * runningStd).transposed(0, 2, 1))
+        let learned = broadcast(newTokens[.newAxis], to: [b, t, Self.stride, d])
+        return concatenated([x[0..., 0..., .newAxis, 0...], learned], axis: 2)
+            .reshaped(b, t * (Self.stride + 1), d)
+    }
+
+    private func project(_ x: MLXArray) -> MLXArray {
+        let (b, d) = (x.dim(0), Self.dimensions)
+        let t = x.dim(1) / (Self.stride + 1)
+        let x = x.reshaped(b, t, Self.stride + 1, d)[0..., 0..., 1..., 0...].reshaped(b, t * Self.stride, d)
         return mapping(x).transposed(0, 2, 1)
+    }
+
+    /// Decodes the same windows as ``decode(_:onPiece:)``, with the blocks read one at a
+    /// time. The first window goes through every block on its own, so its audio is out
+    /// as early as before; the rest then go through each block together, so each block
+    /// is read twice per track instead of once per window.
+    func decode(_ latents: MLXArray, blocks: SAMELBlockStream, onPiece: (MLXArray) -> Void = { _ in })
+        -> MLXArray
+    {
+        let windows = Self.windows(latents)
+        var pieces: [MLXArray] = []
+        func finish(_ x: MLXArray, _ window: SAMEWindow) {
+            let piece = project(x)[.ellipsis, window.keep]
+            eval(piece)
+            pieces.append(piece)
+            onPiece(piece)
+        }
+        var first = embed(windows[0].latents)
+        let band = SAMELDifferentialAttention.band(dtype: first.dtype)
+        for index in 0..<Self.depth {
+            first = blocks.load(index)(first, band: band)
+            eval(first)
+        }
+        finish(first, windows[0])
+
+        var rest = windows.dropFirst().map { embed($0.latents) }
+        if !rest.isEmpty {
+            for index in 0..<Self.depth {
+                let block = blocks.load(index)
+                for i in rest.indices {
+                    rest[i] = block(rest[i], band: band)
+                    eval(rest[i])
+                }
+            }
+        }
+        for (x, window) in zip(rest, windows.dropFirst()) { finish(x, window) }
+        return pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: -1)
     }
 
     /// The output projection ships as a width-1 PyTorch convolution `[out, in, 1]`.

@@ -181,6 +181,9 @@ final class StableAudio3DiTBlock: Module {
 
 final class StableAudio3ContinuousTransformer: Module {
     let config: StableAudio3DiTConfig
+    var trace: ((String, MLXArray) -> Void)?
+    /// When set, `layers` is empty and every block is read from the archive as it runs.
+    var blocks: StableAudio3BlockStream?
 
     @ModuleInfo(key: "project_in") var projectIn: Linear
     @ModuleInfo(key: "project_out") var projectOut: Linear
@@ -188,14 +191,14 @@ final class StableAudio3ContinuousTransformer: Module {
     @ModuleInfo(key: "global_cond_embedder") var globalCondEmbedder: SiLUProjection
     @ModuleInfo(key: "layers") var layers: [StableAudio3DiTBlock]
 
-    init(_ config: StableAudio3DiTConfig) {
+    init(_ config: StableAudio3DiTConfig, streamsBlocks: Bool = false) {
         self.config = config
         let d = config.embedDimension
         _projectIn.wrappedValue = Linear(config.ioChannels, d, bias: false)
         _projectOut.wrappedValue = Linear(d, config.ioChannels, bias: false)
         _memoryTokens.wrappedValue = MLXArray.zeros([config.memoryTokens, d])
         _globalCondEmbedder.wrappedValue = SiLUProjection(d, d, 6 * d, bias: true)
-        _layers.wrappedValue = (0..<config.depth).map { _ in StableAudio3DiTBlock(config) }
+        _layers.wrappedValue = streamsBlocks ? [] : (0..<config.depth).map { _ in StableAudio3DiTBlock(config) }
     }
 
     func callAsFunction(
@@ -205,13 +208,25 @@ final class StableAudio3ContinuousTransformer: Module {
         let memory = broadcast(memoryTokens[.newAxis], to: [b, config.memoryTokens, config.embedDimension])
         var x = concatenated([memory, projectIn(x)], axis: 1)
         let g = globalCondEmbedder(globalEmbed)
-        for layer in layers {
+        trace?("project", x)
+        trace?("g", g)
+        blocks?.load(0)
+        for index in 0..<(blocks == nil ? layers.count : config.depth) {
+            let layer = blocks?.block ?? layers[index]
             let local = layer.toLocalEmbed(localAddCond)
+            if index == 0 { trace?("local", local) }
             let padding = MLXArray.zeros([b, config.memoryTokens, config.embedDimension], dtype: local.dtype)
             x = layer(x, context: context, globalCond: g,
                       localEmbedding: concatenated([padding, local], axis: 1))
+            if let blocks, index + 1 < config.depth {
+                // The graph holds this block's weights; the next block is copied in
+                // while the GPU computes this one.
+                asyncEval(x)
+                blocks.load(index + 1)
+            }
             // One block's intermediates at a time instead of the whole graph's.
             eval(x)
+            trace?("layer_\(index)", x)
         }
         return projectOut(x[0..., config.memoryTokens..., 0...])
     }
@@ -227,8 +242,10 @@ final class StableAudio3DiT: Module {
     @ModuleInfo(key: "to_global_embed") var toGlobalEmbed: SiLUProjection
     @ModuleInfo(key: "to_timestep_embed") var toTimestepEmbed: SiLUProjection
     @ModuleInfo(key: "transformer") var transformer: StableAudio3ContinuousTransformer
+    var computeInFloat16 = false
+    var trace: ((String, MLXArray) -> Void)?
 
-    init(_ config: StableAudio3DiTConfig) {
+    init(_ config: StableAudio3DiTConfig, streamsBlocks: Bool = false) {
         self.config = config
         let d = config.embedDimension
         _preprocessConv.wrappedValue = Conv1d(
@@ -238,7 +255,7 @@ final class StableAudio3DiT: Module {
         _toCondEmbed.wrappedValue = SiLUProjection(config.condTokenDimension, d, d, bias: false)
         _toGlobalEmbed.wrappedValue = SiLUProjection(config.globalCondDimension, d, d, bias: false)
         _toTimestepEmbed.wrappedValue = SiLUProjection(config.timestepFeatures, d, d, bias: true)
-        _transformer.wrappedValue = StableAudio3ContinuousTransformer(config)
+        _transformer.wrappedValue = StableAudio3ContinuousTransformer(config, streamsBlocks: streamsBlocks)
     }
 
     /// Fourier frequencies of the timestep features, scaled by 2π. Computed rather than
@@ -261,15 +278,24 @@ final class StableAudio3DiT: Module {
     ) -> MLXArray {
         let context = toCondEmbed(crossAttnCond)
         let arguments = t[0..., .newAxis] * timestepFrequencies
-        let features = concatenated([cos(arguments), sin(arguments)], axis: -1)
+        let rawFeatures = concatenated([cos(arguments), sin(arguments)], axis: -1)
+        let features = computeInFloat16 ? rawFeatures.asType(.float16) : rawFeatures
         let globalEmbed = toGlobalEmbed(globalCond) + toTimestepEmbed(features)
+        trace?("features", features)
+        trace?("context", context)
+        trace?("global", globalEmbed)
 
         let channelsLast = x.transposed(0, 2, 1)
         let input = preprocessConv(channelsLast) + channelsLast
+        trace?("input", input)
         // Text-to-audio: no inpainting mask or masked input.
-        let local = MLXArray.zeros([x.dim(0), x.dim(-1), config.localAddCondDimension])
+        let local = MLXArray.zeros([x.dim(0), x.dim(-1), config.localAddCondDimension],
+                                  dtype: computeInFloat16 ? .float16 : .float32)
+        transformer.trace = trace
         let h = transformer(input, context: context, globalEmbed: globalEmbed, localAddCond: local)
-        return (postprocessConv(h) + h).transposed(0, 2, 1)
+        let velocity = (postprocessConv(h) + h).transposed(0, 2, 1)
+        trace?("velocity", velocity)
+        return velocity
     }
 
     /// Maps upstream weight names onto this module tree. Index-addressed lists with
@@ -278,19 +304,24 @@ final class StableAudio3DiT: Module {
     static func sanitize(_ weights: [String: MLXArray]) -> [String: MLXArray] {
         var result: [String: MLXArray] = [:]
         for (key, value) in weights {
-            if key.hasPrefix("cond.") || key.hasSuffix("rotary_pos_emb.inv_freq") { continue }
-            var name = key
-            for list in ["to_cond_embed", "to_global_embed", "to_timestep_embed",
-                         "global_cond_embedder", "to_local_embed.seq"] {
-                name = name.replacingOccurrences(of: "\(list).0.", with: "\(list).input.")
-                name = name.replacingOccurrences(of: "\(list).2.", with: "\(list).output.")
-            }
-            name = name.replacingOccurrences(of: "to_local_embed.seq.", with: "to_local_embed.")
-            name = name.replacingOccurrences(of: ".ff.ff.0.proj.", with: ".ff.glu.")
-            name = name.replacingOccurrences(of: ".ff.ff.2.", with: ".ff.out.")
-            result[name] = value
+            if let name = moduleKey(key) { result[name] = value }
         }
         return result
+    }
+
+    /// The module path of an upstream weight name; nil for names the module does not hold.
+    static func moduleKey(_ key: String) -> String? {
+        if key.hasPrefix("cond.") || key.hasSuffix("rotary_pos_emb.inv_freq") { return nil }
+        var name = key
+        for list in ["to_cond_embed", "to_global_embed", "to_timestep_embed",
+                     "global_cond_embedder", "to_local_embed.seq"] {
+            name = name.replacingOccurrences(of: "\(list).0.", with: "\(list).input.")
+            name = name.replacingOccurrences(of: "\(list).2.", with: "\(list).output.")
+        }
+        name = name.replacingOccurrences(of: "to_local_embed.seq.", with: "to_local_embed.")
+        name = name.replacingOccurrences(of: ".ff.ff.0.proj.", with: ".ff.glu.")
+        name = name.replacingOccurrences(of: ".ff.ff.2.", with: ".ff.out.")
+        return name
     }
 }
 

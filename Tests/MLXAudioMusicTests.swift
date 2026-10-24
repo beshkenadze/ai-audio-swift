@@ -169,6 +169,66 @@ struct StableAudio3ParityTests {
         #expect(final < 5e-2)
     }
 
+    /// Independent Python/MLX fixture using the same FP16 conditioning inputs.
+    /// FP16 kernels in different builds round differently: stage diagnostics
+    /// match conditioning exactly and transformer outputs to >60 dB, while the
+    /// final projection amplifies rounding. Bound velocity RMS error to 1%; full
+    /// audio/gate comparisons validate the optimization separately.
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["MLXAUDIO_SA3_FP16_REFERENCE"] != nil))
+    func float16TransformerMatchesReference() throws {
+        let path = try #require(ProcessInfo.processInfo.environment["MLXAUDIO_SA3_FP16_REFERENCE"])
+        let fixture = try NPZArchive(url: URL(fileURLWithPath: path))
+        let model = try StableAudio3.loadDiT(
+            weights.appendingPathComponent(variant.ditWeights), config: variant.ditConfig)
+        model.computeInFloat16 = true
+        var trace: [String: MLXArray] = [:]
+        if ProcessInfo.processInfo.environment["MLXAUDIO_SA3_FP16_TRACE"] != nil {
+            model.trace = { trace[$0] = $1 }
+        }
+        let velocity = model(try fixture.array("noise"),
+                             t: try fixture.array("sigmas")[0] * MLXArray.ones([1], dtype: .float16),
+                             crossAttnCond: try fixture.array("cross_attn"),
+                             globalCond: try fixture.array("global_cond"))
+        let expected = try fixture.array("v0").asType(.float32)
+        let actual = velocity.asType(.float32)
+        let error = mean(square(actual - expected)).item(Float.self)
+        let energy = mean(square(expected)).item(Float.self)
+        let snr = 10 * Foundation.log10(energy / max(error, 1e-20))
+        print("SA3 FP16 Swift/reference velocity: SNR \(snr) dB, dtype \(velocity.dtype)")
+        if let path = ProcessInfo.processInfo.environment["MLXAUDIO_SA3_FP16_TRACE"] {
+            try MLX.save(arrays: trace, url: URL(fileURLWithPath: path))
+        }
+        #expect(velocity.dtype == .float16)
+        #expect(snr >= 40)
+    }
+
+    /// Streaming the blocks must not change one bit: the same first velocity and, for
+    /// Medium, whose decoder also streams, the same patches.
+    @Test func streamedBlocksMatchResident() throws {
+        let dit = weights.appendingPathComponent(variant.ditWeights)
+        let (noise, crossAttn, global, sigmas) = (try ref("noise"), try ref("cross_attn"),
+                                                  try ref("global_cond"), try ref("sigmas"))
+        func velocity(streamsBlocks: Bool) throws -> MLXArray {
+            let model = try StableAudio3.loadDiT(dit, config: variant.ditConfig, streamsBlocks: streamsBlocks)
+            model.computeInFloat16 = true
+            let v = model(noise, t: sigmas[0] * MLXArray.ones([1], dtype: .float16),
+                          crossAttnCond: crossAttn, globalCond: global)
+            eval(v)
+            return v
+        }
+        let resident = try velocity(streamsBlocks: false)
+        Memory.clearCache()
+        #expect(bitwiseEqual(try velocity(streamsBlocks: true), resident))
+
+        guard variant == .medium else { return }
+        let url = weights.appendingPathComponent(variant.decoderWeights)
+        let latents = try ref("latents").asType(.float32)
+        let expected = try StableAudio3.loadMediumDecoder(url).decode(latents)
+        Memory.clearCache()
+        let (decoder, blocks) = try StableAudio3.loadStreamedMediumDecoder(url)
+        #expect(bitwiseEqual(decoder.decode(latents, blocks: blocks), expected))
+    }
+
     @Test func decoderMatches() throws {
         let url = weights.appendingPathComponent(variant.decoderWeights)
         let latents = try ref("latents").asType(.float32)

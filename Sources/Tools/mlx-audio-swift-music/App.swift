@@ -15,7 +15,6 @@ enum CLIError: Error, CustomStringConvertible {
         }
     }
 }
-
 struct CLI {
     var weights: URL?
     var variant = StableAudio3.Variant.smallMusic
@@ -23,6 +22,10 @@ struct CLI {
     var seconds = 30.0
     var seed: UInt64 = 0
     var steps = 8
+    var precision = StableAudio3.DiTPrecision.reference
+    var dutyCycle = 1.0
+    var cacheMB = 64
+    var textCache: URL?
     var output: URL?
 
     static func parse(_ arguments: [String]) throws -> CLI {
@@ -40,6 +43,10 @@ struct CLI {
                 guard let variant = StableAudio3.Variant(rawValue: raw) else { throw CLIError.invalidValue(arg, raw) }
                 cli.variant = variant
             case "--prompt": cli.prompt = try value(arg)
+            case "--dit-precision":
+                let raw = try value(arg)
+                guard let precision = StableAudio3.DiTPrecision(rawValue: raw) else { throw CLIError.invalidValue(arg, raw) }
+                cli.precision = precision
             case "--seconds":
                 let raw = try value(arg)
                 guard let seconds = Double(raw), seconds > 0 else { throw CLIError.invalidValue(arg, raw) }
@@ -52,6 +59,17 @@ struct CLI {
                 let raw = try value(arg)
                 guard let steps = Int(raw), steps > 0 else { throw CLIError.invalidValue(arg, raw) }
                 cli.steps = steps
+            case "--duty-cycle":
+                let raw = try value(arg)
+                guard let duty = Double(raw), duty.isFinite, duty > 0, duty <= 1 else {
+                    throw CLIError.invalidValue(arg, raw)
+                }
+                cli.dutyCycle = duty
+            case "--cache-mb":
+                let raw = try value(arg)
+                guard let mb = Int(raw), (0...1024).contains(mb) else { throw CLIError.invalidValue(arg, raw) }
+                cli.cacheMB = mb
+            case "--text-cache": cli.textCache = URL(fileURLWithPath: try value(arg), isDirectory: true)
             case "--out", "-o": cli.output = URL(fileURLWithPath: try value(arg))
             case "--help", "-h":
                 printUsage()
@@ -81,6 +99,10 @@ struct CLI {
               --seconds <s>       Length in seconds. Default: 30
               --seed <n>          Random seed. Default: 0
               --steps <n>         Sampler steps. Default: 8
+              --dit-precision <p> reference (default) or fp16; decoder remains FP32
+              --duty-cycle <n>  GPU work fraction (0 < n <= 1); default 1, gentle 0.25
+              --cache-mb <n>    Maximum reusable MLX cache in MiB; default 64
+              --text-cache <dir>  Keep prompt embeddings here and reuse them
               --out, -o <path>    Output WAV, 16-bit stereo 44.1 kHz
             """
         )
@@ -125,23 +147,38 @@ enum App {
     static func main() {
         do {
             let cli = try CLI.parse(Array(CommandLine.arguments.dropFirst()))
-            let model = StableAudio3(variant: cli.variant, weightsDirectory: cli.weights!)
+            Memory.cacheLimit = cli.cacheMB * 1_048_576
+            let pacer = InferencePacer(dutyCycle: cli.dutyCycle, synchronize: { Stream.gpu.synchronize() })
+            let model = StableAudio3(variant: cli.variant, weightsDirectory: cli.weights!,
+                                     textCacheDirectory: cli.textCache)
             let started = Date()
             let writer = try WAVWriter(url: cli.output!, channels: 2, sampleRate: StableAudio3.sampleRate,
                                        frames: StableAudio3.sampleCount(seconds: cli.seconds))
             var writeError: Error?
             let audio = try model.generate(
-                .init(prompt: cli.prompt!, seconds: cli.seconds, seed: cli.seed, steps: cli.steps),
+                .init(prompt: cli.prompt!, seconds: cli.seconds, seed: cli.seed, steps: cli.steps,
+                      precision: cli.precision),
                 progress: { stage in
+                    // Loading models is disk and copying, not GPU work: resting three
+                    // times as long after it (at duty 0.25) only held the memory longer.
+                    if case .sampling(step: 0, of: _) = stage {
+                        pacer.restart()
+                        return
+                    }
+                    // Sampling callbacks follow eval; synchronization also waits
+                    // for GPU command completion before giving other apps a turn.
+                    pacer.rest()
                     switch stage {
                     case .encodingText: print("text encoder")
                     case .sampling(let step, let total): print("sample \(step)/\(total)")
                     case .decoding: print("decoder")
                     }
+                    fflush(nil)
                 },
                 onAudio: { piece in
                     guard writeError == nil else { return }
                     do { try writer.append(piece) } catch { writeError = error }
+                    pacer.rest()
                 })
             if let writeError { throw writeError }
             try writer.close()

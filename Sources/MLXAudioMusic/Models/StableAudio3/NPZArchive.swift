@@ -42,12 +42,24 @@ public struct NPZArchive {
 
     public func contains(_ name: String) -> Bool { payloads[name] != nil }
 
+    /// An entry whose header has been checked, so copying it out cannot fail.
+    struct Entry {
+        let name: String
+        let descr: String
+        let shape: [Int]
+        let body: Range<Int>
+    }
+
     public func array(_ name: String) throws -> MLXArray {
+        array(try entry(name))
+    }
+
+    func entry(_ name: String) throws -> Entry {
         let (descr, shape, body) = try header(name)
         let itemSize: Int
         switch descr {
         case "<f2": itemSize = 2
-        case "<f4", "<i4": itemSize = 4
+        case "<f4", "<i4", "<u4": itemSize = 4
         case "<i8", "<f8": itemSize = 8
         case "|u1", "|b1": itemSize = 1
         default: throw NPZArchiveError.unsupportedDType(name, descr)
@@ -59,20 +71,29 @@ public struct NPZArchive {
         guard !overflow, count.multipliedReportingOverflow(by: itemSize) == (body.count, false) else {
             throw NPZArchiveError.malformedHeader(name)
         }
+        return Entry(name: name, descr: descr, shape: shape, body: body)
+    }
+
+    func array(_ entry: Entry) -> MLXArray {
+        data[entry.body].withUnsafeBytes { Self.array(entry, from: $0) }
+    }
+
+    /// `bytes` are the entry's body, from the mapping or read into a buffer.
+    static func array(_ entry: Entry, from bytes: UnsafeRawBufferPointer) -> MLXArray {
         func make<T: HasDType>(_ type: T.Type) -> MLXArray {
-            MLXArray(data[body], shape, type: type)
+            MLXArray(bytes, entry.shape, type: type)
         }
-        switch descr {
+        switch entry.descr {
         case "<f2": return make(Float16.self)
         case "<f4": return make(Float32.self)
         case "<i4": return make(Int32.self)
+        case "<u4": return make(UInt32.self)
         case "<i8": return make(Int64.self)
         case "|u1": return make(UInt8.self)
         case "|b1": return make(Bool.self)
         default:
             // float64: MLX has no float64 on the GPU; every consumer here wants float32.
-            let values = data[body].withUnsafeBytes { Array($0.bindMemory(to: Double.self)) }
-            return MLXArray(values.map(Float.init), shape)
+            return MLXArray(bytes.bindMemory(to: Double.self).map(Float.init), entry.shape)
         }
     }
 
@@ -81,10 +102,18 @@ public struct NPZArchive {
         Data(data[try header(name).body])
     }
 
+    /// In file order: `np.savez` stores entries in no useful order.
+    func entries(where include: (String) -> Bool = { _ in true }) throws -> [Entry] {
+        try payloads.filter { include($0.key) }
+            .sorted { $0.value.lowerBound < $1.value.lowerBound }
+            .map { try entry($0.key) }
+    }
+
     public func arrays(where include: (String) -> Bool = { _ in true }) throws -> [String: MLXArray] {
+        let reader = NPZEntryReader(self)
         var result: [String: MLXArray] = [:]
-        for name in payloads.keys where include(name) {
-            result[name] = try array(name)
+        for entry in try entries(where: include) {
+            result[entry.name] = reader.array(entry)
         }
         return result
     }
@@ -208,6 +237,48 @@ public struct NPZArchive {
             cursor = nameRange.upperBound + extraLength + commentLength
         }
         return payloads
+    }
+}
+
+/// Copies entries out of an archive with one positioned read each.
+///
+/// Faulting a model in through the mapping a page at a time ran at 0.5 GB/s with the
+/// file cache cold, and far slower under memory pressure, where the cache does not
+/// survive from one sampling step to the next. A whole-entry read runs at disk speed.
+final class NPZEntryReader {
+    let archive: NPZArchive
+    private let fd: Int32
+    private var buffer = UnsafeMutableRawBufferPointer.allocate(byteCount: 1, alignment: 1 << 14)
+
+    init(_ archive: NPZArchive) {
+        self.archive = archive
+        fd = open(archive.url.path, O_RDONLY)
+    }
+
+    deinit {
+        if fd >= 0 { close(fd) }
+        buffer.deallocate()
+    }
+
+    /// Larger entries, such as a 393 MB embedding table, are one sequential range of
+    /// the mapping, which the kernel reads ahead without a buffer of their size.
+    private static let largestRead = 64 << 20
+
+    /// Falls back to the mapping if the read fails.
+    func array(_ entry: NPZArchive.Entry) -> MLXArray {
+        let count = entry.body.count
+        guard fd >= 0, count > 0, count <= Self.largestRead else { return archive.array(entry) }
+        if buffer.count < count {
+            buffer.deallocate()
+            buffer = .allocate(byteCount: count, alignment: 1 << 14)
+        }
+        var done = 0
+        while done < count {
+            let n = pread(fd, buffer.baseAddress! + done, count - done, off_t(entry.body.lowerBound + done))
+            guard n > 0 else { return archive.array(entry) }
+            done += n
+        }
+        return NPZArchive.array(entry, from: UnsafeRawBufferPointer(rebasing: buffer[0..<count]))
     }
 }
 

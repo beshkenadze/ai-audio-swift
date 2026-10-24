@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import MLX
 import MLXNN
@@ -6,8 +7,9 @@ import MLXNN
 /// `stabilityai/stable-audio-3-optimized` (`MLX/*.npz`).
 ///
 /// Generation runs in three stages — text encoder, diffusion transformer, decoder —
-/// and each model is loaded for its stage and released after it, so the peak is
-/// the largest single model rather than all three.
+/// and each model is loaded for its stage and released after it. The transformer and
+/// the Medium decoder also stream their blocks from the archive, so a stage holds
+/// about one block of weights rather than its whole model.
 public struct StableAudio3 {
     public enum Variant: String, CaseIterable, Sendable {
         case smallMusic = "sm-music"
@@ -26,30 +28,44 @@ public struct StableAudio3 {
     /// Audio samples per latent position: 256-sample patches, 16 per latent.
     public static let samplesPerLatent = 4096
 
+    public enum DiTPrecision: String, Sendable {
+        /// Preserve the reference's FP32 promotion through timestep/local conditioning.
+        case reference
+        /// FP32 Fourier features, then FP16 projections and DiT activations.
+        case float16 = "fp16"
+    }
+
     public struct Request: Sendable {
         public var prompt: String
         public var seconds: Double
         public var seed: UInt64
         public var steps: Int
+        public var precision: DiTPrecision
 
-        public init(prompt: String, seconds: Double, seed: UInt64, steps: Int = 8) {
+        public init(prompt: String, seconds: Double, seed: UInt64, steps: Int = 8,
+                    precision: DiTPrecision = .reference) {
             self.prompt = prompt
             self.seconds = seconds
             self.seed = seed
             self.steps = steps
+            self.precision = precision
         }
     }
 
     public enum Stage: Sendable {
+        /// `sampling(step: 0, …)` marks the models loaded and the first step starting.
         case encodingText, sampling(step: Int, of: Int), decoding
     }
 
     public let variant: Variant
     public let weightsDirectory: URL
+    /// Where prompt embeddings are kept between runs; nil encodes every prompt.
+    public let textCacheDirectory: URL?
 
-    public init(variant: Variant, weightsDirectory: URL) {
+    public init(variant: Variant, weightsDirectory: URL, textCacheDirectory: URL? = nil) {
         self.variant = variant
         self.weightsDirectory = weightsDirectory
+        self.textCacheDirectory = textCacheDirectory
     }
 
     /// Stereo audio `[2, samples]` at 44.1 kHz, float32, trimmed to `request.seconds`.
@@ -62,21 +78,18 @@ public struct StableAudio3 {
         let latentLength = Self.latentLength(seconds: request.seconds)
 
         progress(.encodingText)
-        let (embeddings, mask) = try autoreleasedStage {
-            let encoder = try StableAudio3TextEncoder(npz: url(StableAudio3.Variant.textEncoderWeights))
-            let (embeddings, mask) = encoder.encode(request.prompt)
-            eval(embeddings, mask)
-            return (embeddings, mask)
-        }
+        let (embeddings, mask) = try autoreleasedStage { try encodeText(request.prompt) }
 
         let latents = try autoreleasedStage {
             let dit = try url(variant.ditWeights)
+            let model = try Self.loadDiT(dit, config: variant.ditConfig, streamsBlocks: true)
             let conditioning = try Conditioning(npz: dit)
                 .callAsFunction(embeddings: embeddings, mask: mask, seconds: request.seconds)
-            let model = try Self.loadDiT(dit, config: variant.ditConfig)
+            model.computeInFloat16 = request.precision == .float16
             let noise = MLXRandom.normal(
                 [1, variant.ditConfig.ioChannels, latentLength],
                 dtype: .float16, key: MLXRandom.key(request.seed))
+            progress(.sampling(step: 0, of: request.steps))
             let latents = Self.sample(
                 noise: noise, sigmas: Self.schedule(steps: request.steps), seed: request.seed + 1,
                 velocity: { model($0, t: $1, crossAttnCond: conditioning.crossAttn,
@@ -105,7 +118,9 @@ public struct StableAudio3 {
             }
             switch variant {
             case .smallMusic: _ = try Self.loadDecoder(weights).decode(latents, onPiece: emit)
-            case .medium: _ = try Self.loadMediumDecoder(weights).decode(latents, onPiece: emit)
+            case .medium:
+                let (decoder, blocks) = try Self.loadStreamedMediumDecoder(weights)
+                _ = decoder.decode(latents, blocks: blocks, onPiece: emit)
             }
             let audio = concatenated(pieces, axis: 1)
             eval(audio)
@@ -138,10 +153,21 @@ public struct StableAudio3 {
         return try body()
     }
 
-    static func loadDiT(_ url: URL, config: StableAudio3DiTConfig = .smallMusic) throws -> StableAudio3DiT {
-        let model = StableAudio3DiT(config)
-        let weights = StableAudio3DiT.sanitize(try NPZArchive(url: url).arrays { !$0.hasPrefix("cond.") })
-            .mapValues { $0.asType(.float16) }
+    /// With `streamsBlocks`, only the weights outside the transformer blocks are loaded
+    /// here; the blocks are read from the archive as they run.
+    static func loadDiT(
+        _ url: URL, config: StableAudio3DiTConfig = .smallMusic, streamsBlocks: Bool = false
+    ) throws -> StableAudio3DiT {
+        let model = StableAudio3DiT(config, streamsBlocks: streamsBlocks)
+        let archive = try NPZArchive(url: url)
+        if streamsBlocks {
+            model.transformer.blocks = try StableAudio3BlockStream(archive: archive, config: config)
+        }
+        let weights = StableAudio3Quantization.cast(StableAudio3DiT.sanitize(try archive.arrays {
+            !$0.hasPrefix("cond.") && $0 != "QUANTIZATION"
+                && !(streamsBlocks && $0.hasPrefix("transformer.layers."))
+        }), to: .float16)
+        try StableAudio3Quantization.prepare(model, archive: archive, weights: weights)
         try model.update(parameters: ModuleParameters.unflattened(weights), verify: .all)
         eval(model.parameters())
         return model
@@ -149,7 +175,10 @@ public struct StableAudio3 {
 
     static func loadDecoder(_ url: URL) throws -> SAMESDecoder {
         let model = SAMESDecoder()
-        let weights = SAMESDecoder.sanitize(try NPZArchive(url: url).arrays()).mapValues { $0.asType(.float32) }
+        let archive = try NPZArchive(url: url)
+        let weights = StableAudio3Quantization.cast(SAMESDecoder.sanitize(
+            try archive.arrays { $0 != "QUANTIZATION" }), to: .float32)
+        try StableAudio3Quantization.prepare(model, archive: archive, weights: weights)
         try model.update(parameters: ModuleParameters.unflattened(weights), verify: .all)
         eval(model.parameters())
         return model
@@ -157,10 +186,71 @@ public struct StableAudio3 {
 
     static func loadMediumDecoder(_ url: URL) throws -> SAMELDecoder {
         let model = SAMELDecoder()
-        let weights = SAMELDecoder.sanitize(try NPZArchive(url: url).arrays()).mapValues { $0.asType(.float32) }
+        let archive = try NPZArchive(url: url)
+        let weights = StableAudio3Quantization.cast(SAMELDecoder.sanitize(
+            try archive.arrays { $0 != "QUANTIZATION" }), to: .float32)
+        try StableAudio3Quantization.prepare(model, archive: archive, weights: weights)
         try model.update(parameters: ModuleParameters.unflattened(weights), verify: .all)
         eval(model.parameters())
         return model
+    }
+
+    static func loadStreamedMediumDecoder(_ url: URL) throws -> (SAMELDecoder, SAMELBlockStream) {
+        let model = SAMELDecoder(streamsBlocks: true)
+        let archive = try NPZArchive(url: url)
+        let blocks = try SAMELBlockStream(archive: archive)
+        let weights = StableAudio3Quantization.cast(SAMELDecoder.sanitize(
+            try archive.arrays { $0 != "QUANTIZATION" && !$0.hasPrefix("blocks.") }), to: .float32)
+        try StableAudio3Quantization.prepare(model, archive: archive, weights: weights)
+        try model.update(parameters: ModuleParameters.unflattened(weights), verify: .all)
+        eval(model.parameters())
+        return (model, blocks)
+    }
+
+    // MARK: - Text
+
+    /// The encoder's output depends only on the prompt and the encoder weights, and the
+    /// app renders the same few prompts again and again: a hit skips loading 0.57 GB.
+    private func encodeText(_ prompt: String) throws -> (embeddings: MLXArray, mask: MLXArray) {
+        let weights = try url(Variant.textEncoderWeights)
+        let cached = try textCacheDirectory.map {
+            $0.appendingPathComponent(try Self.textCacheKey(prompt: prompt, weights: weights) + ".safetensors")
+        }
+        if let cached, let arrays = try? MLX.loadArrays(url: cached),
+           let embeddings = arrays["embeddings"], let mask = arrays["mask"],
+           embeddings.ndim == 3, embeddings.shape.prefix(2) == [1, StableAudio3TextEncoder.maxLength],
+           embeddings.dtype == .float16, mask.shape == [1, StableAudio3TextEncoder.maxLength], mask.dtype == .int32 {
+            eval(embeddings, mask)
+            return (embeddings, mask)
+        }
+        let encoder = try StableAudio3TextEncoder(npz: weights)
+        let (embeddings, mask) = encoder.encode(prompt)
+        eval(embeddings, mask)
+        if let cached {
+            // Written aside and renamed, so a reader never sees half a file.
+            let directory = cached.deletingLastPathComponent()
+            let partial = directory.appendingPathComponent("\(UUID().uuidString).safetensors")
+            do {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                try MLX.save(arrays: ["embeddings": embeddings, "mask": mask], url: partial)
+                // rename(2) replaces an existing entry in one step; there is no moment without one.
+                guard rename(partial.path, cached.path) == 0 else { throw CocoaError(.fileWriteUnknown) }
+            } catch {
+                try? FileManager.default.removeItem(at: partial)
+            }
+        }
+        return (embeddings, mask)
+    }
+
+    /// The prompt and the identity of the encoder file it was encoded with.
+    static func textCacheKey(prompt: String, weights: URL) throws -> String {
+        let file = weights.resolvingSymlinksInPath()
+        let values = try file.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+        let identity = [
+            "stable-audio-3-text-v1", file.path, String(values.fileSize ?? 0),
+            String(values.contentModificationDate?.timeIntervalSince1970 ?? 0), prompt,
+        ].joined(separator: "\u{0}")
+        return SHA256.hash(data: Data(identity.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
     // MARK: - Conditioning
