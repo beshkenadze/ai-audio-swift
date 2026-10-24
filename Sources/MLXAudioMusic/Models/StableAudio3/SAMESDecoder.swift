@@ -101,8 +101,6 @@ final class SAMESDecoder: Module, SAMEDecoding {
     static let stride = 16
     static let window = (chunk: 8, overlap: 2)
     private static let subChunk = stride + 1
-    private static let attentionWindow = 32 + 32 / stride
-    private static let shift = attentionWindow / 2
 
     @ParameterInfo(key: "running_std") var runningStd: MLXArray
     @ModuleInfo(key: "project_in") var projectIn: Linear
@@ -129,14 +127,7 @@ final class SAMESDecoder: Module, SAMEDecoding {
         let learned = broadcast(newTokens[.newAxis], to: [b, t, Self.stride, d])
         x = concatenated([x[0..., 0..., .newAxis, 0...], learned], axis: 2)
         let length = t * Self.subChunk
-        x = x.reshaped(b * length / Self.attentionWindow, Self.attentionWindow, d)
-        for block in blocks[0..<3] { x = block(x) }
-        x = x.reshaped(b, length, d)
-
-        x = concatenated([x[0..., ..<Self.shift, 0...], x, x[0..., (length - Self.shift)..., 0...]], axis: 1)
-        x = x.reshaped(b * (length + Self.attentionWindow) / Self.attentionWindow, Self.attentionWindow, d)
-        for block in blocks[3...] { x = block(x) }
-        x = x.reshaped(b, length + Self.attentionWindow, d)[0..., Self.shift..<(Self.shift + length), 0...]
+        x = sameSWindowedBlocks(x.reshaped(b, length, d), blocks: blocks)
 
         x = x.reshaped(b * t, Self.subChunk, d)[0..., 1..., 0...].reshaped(b, t * Self.stride, d)
         return mapping(x).transposed(0, 2, 1)

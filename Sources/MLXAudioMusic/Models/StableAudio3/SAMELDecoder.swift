@@ -30,15 +30,15 @@ final class SAMELDifferentialAttention: Module {
             .asType(dtype)
     }
 
-    func callAsFunction(_ x: MLXArray, band: MLXArray) -> MLXArray {
+    func callAsFunction(_ x: MLXArray, band: MLXArray, offset: Int = 0) -> MLXArray {
         let (b, t, d) = (x.dim(0), x.dim(1), x.dim(2))
         let parts = toQKV(x).split(parts: 5, axis: -1).map {
             $0.reshaped(b, t, Self.heads, Self.headDim).transposed(0, 2, 1, 3)
         }
-        let q1 = rope(qNorm(parts[0]), 32)
-        let k1 = rope(kNorm(parts[1]), 32)
-        let q2 = rope(qNorm(parts[3]), 32)
-        let k2 = rope(kNorm(parts[4]), 32)
+        let q1 = rope(qNorm(parts[0]), 32, offset: offset)
+        let k1 = rope(kNorm(parts[1]), 32, offset: offset)
+        let q2 = rope(qNorm(parts[3]), 32, offset: offset)
+        let k2 = rope(kNorm(parts[4]), 32, offset: offset)
         let out = t <= Self.group
             ? differential(q1, k1, parts[2], q2, k2, mask: nil)
             : slidingWindow(q1, k1, parts[2], q2, k2, band: band)
@@ -118,8 +118,8 @@ final class SAMELBlock: Module {
         _ff.wrappedValue = SAMELFeedForward(dimensions: dimensions, inner: 4608, sineGate: sineGate)
     }
 
-    func callAsFunction(_ x: MLXArray, band: MLXArray) -> MLXArray {
-        let x = x + attention(preNorm(x), band: band)
+    func callAsFunction(_ x: MLXArray, band: MLXArray, offset: Int = 0) -> MLXArray {
+        let x = x + attention(preNorm(x), band: band, offset: offset)
         // Frees the attention's windowed copies before the feed-forward allocates.
         eval(x)
         return x + ff(ffNorm(x))

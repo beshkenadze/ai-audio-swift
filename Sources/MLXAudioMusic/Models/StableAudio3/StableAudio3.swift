@@ -17,6 +17,7 @@ public struct StableAudio3 {
 
         var ditWeights: String { "dit_\(rawValue)_f16.npz" }
         var decoderWeights: String { self == .medium ? "same_l_decoder_f32.npz" : "same_s_decoder_f32.npz" }
+        public var encoderWeights: String { self == .medium ? "same_l_encoder_f32.npz" : "same_s_encoder_f32.npz" }
         var ditConfig: StableAudio3DiTConfig { self == .medium ? .medium : .smallMusic }
         static let textEncoderWeights = "t5gemma_f16.npz"
 
@@ -41,20 +42,27 @@ public struct StableAudio3 {
         public var seed: UInt64
         public var steps: Int
         public var precision: DiTPrecision
+        public var initAudio: URL?
+        public var initNoiseLevel: Float
+        public var initAudioOffset: Double
 
         public init(prompt: String, seconds: Double, seed: UInt64, steps: Int = 8,
-                    precision: DiTPrecision = .reference) {
+                    precision: DiTPrecision = .reference, initAudio: URL? = nil,
+                    initNoiseLevel: Float = 1, initAudioOffset: Double = 0) {
             self.prompt = prompt
             self.seconds = seconds
             self.seed = seed
             self.steps = steps
             self.precision = precision
+            self.initAudio = initAudio
+            self.initNoiseLevel = initNoiseLevel
+            self.initAudioOffset = initAudioOffset
         }
     }
 
     public enum Stage: Sendable {
         /// `sampling(step: 0, …)` marks the models loaded and the first step starting.
-        case encodingText, sampling(step: Int, of: Int), decoding
+        case encodingText, encodingAudio, sampling(step: Int, of: Int), decoding
     }
 
     public let variant: Variant
@@ -75,10 +83,31 @@ public struct StableAudio3 {
     public func generate(
         _ request: Request, progress: (Stage) -> Void = { _ in }, onAudio: (MLXArray) -> Void = { _ in }
     ) throws -> MLXArray {
+        guard request.seconds.isFinite, request.seconds > 0, request.steps > 0,
+              request.initNoiseLevel.isFinite, (0.01...1).contains(request.initNoiseLevel),
+              request.initAudioOffset.isFinite, request.initAudioOffset >= 0 else {
+            throw CocoaError(.validationMissingMandatoryProperty)
+        }
         let latentLength = Self.latentLength(seconds: request.seconds)
 
         progress(.encodingText)
         let (embeddings, mask) = try autoreleasedStage { try encodeText(request.prompt) }
+
+        let initLatents: MLXArray?
+        if let audio = request.initAudio {
+            progress(.encodingAudio)
+            initLatents = try autoreleasedStage {
+                let length = Self.encoderLatentLength(latentLength, variant: variant)
+                let input = try Self.loadInitAudio(audio, frames: length * Self.samplesPerLatent,
+                                                  offset: request.initAudioOffset)
+                let encoded = try Self.encodeAudio(Self.patch(input), weights: url(variant.encoderWeights),
+                                            variant: variant)[.ellipsis, ..<latentLength].asType(.float16)
+                eval(encoded)
+                return encoded
+            }
+        } else {
+            initLatents = nil
+        }
 
         let latents = try autoreleasedStage {
             let dit = try url(variant.ditWeights)
@@ -86,12 +115,13 @@ public struct StableAudio3 {
             let conditioning = try Conditioning(npz: dit)
                 .callAsFunction(embeddings: embeddings, mask: mask, seconds: request.seconds)
             model.computeInFloat16 = request.precision == .float16
-            let noise = MLXRandom.normal(
+            let pureNoise = MLXRandom.normal(
                 [1, variant.ditConfig.ioChannels, latentLength],
                 dtype: .float16, key: MLXRandom.key(request.seed))
+            let noise = Self.initialNoise(pureNoise, initLatents: initLatents, sigma: request.initNoiseLevel)
             progress(.sampling(step: 0, of: request.steps))
             let latents = Self.sample(
-                noise: noise, sigmas: Self.schedule(steps: request.steps), seed: request.seed + 1,
+                noise: noise, sigmas: Self.schedule(steps: request.steps, sigmaMax: request.initNoiseLevel), seed: request.seed + 1,
                 velocity: { model($0, t: $1, crossAttnCond: conditioning.crossAttn,
                                   globalCond: conditioning.global) },
                 onStep: { progress(.sampling(step: $0, of: request.steps)) })
@@ -300,8 +330,17 @@ public struct StableAudio3 {
 
     // MARK: - Sampling
 
-    /// Linear noise levels from 1 to 0, warped through log-SNR (anchor −6.2, end 2.0),
-    /// with the first level pinned to 1.
+    static func encoderLatentLength(_ length: Int, variant: Variant) -> Int {
+        variant == .smallMusic ? (length + 1) / 2 * 2 : length
+    }
+
+    static func initialNoise(_ noise: MLXArray, initLatents: MLXArray?, sigma: Float) -> MLXArray {
+        guard let initLatents, sigma != 1 else { return noise }
+        return initLatents * (1 - sigma) + noise * sigma
+    }
+
+    /// Linear noise levels from `sigmaMax` to 0, warped through log-SNR (−6.2 to 2.0),
+    /// with the first level pinned to `sigmaMax`, as in the MLX reference.
     static func schedule(steps: Int, sigmaMax: Float = 1) -> MLXArray {
         let t = linspace(sigmaMax, Float(0), count: steps + 1)
         let logSNR = 2.0 - t * Float(2.0 - -6.2)
@@ -346,5 +385,13 @@ public struct StableAudio3 {
         return patches.reshaped(b, channels, patchSize, length)
             .transposed(0, 1, 3, 2)
             .reshaped(b, channels, length * patchSize)
+    }
+
+    static func patch(_ audio: MLXArray, patchSize: Int = 256) -> MLXArray {
+        let (b, c, samples) = (audio.dim(0), audio.dim(1), audio.dim(2))
+        precondition(samples % patchSize == 0)
+        let length = samples / patchSize
+        return audio.reshaped(b, c, length, patchSize).transposed(0, 1, 3, 2)
+            .reshaped(b, c * patchSize, length)
     }
 }

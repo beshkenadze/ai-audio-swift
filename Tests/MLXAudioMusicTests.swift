@@ -4,6 +4,7 @@ import Testing
 
 @testable import MLXAudioMusic
 
+@Suite(.serialized)
 struct StableAudio3ScheduleTests {
     @Test func scheduleMatchesTheReferenceLogSNRShift() {
         let sigmas = StableAudio3.schedule(steps: 8).asArray(Float.self)

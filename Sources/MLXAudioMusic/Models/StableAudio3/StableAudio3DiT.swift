@@ -274,7 +274,8 @@ final class StableAudio3DiT: Module {
     ///   - globalCond: `[B, globalCondDimension]`.
     /// - Returns: velocity `[B, ioChannels, T]`.
     func callAsFunction(
-        _ x: MLXArray, t: MLXArray, crossAttnCond: MLXArray, globalCond: MLXArray
+        _ x: MLXArray, t: MLXArray, crossAttnCond: MLXArray, globalCond: MLXArray,
+        localAddCond: MLXArray? = nil
     ) -> MLXArray {
         let context = toCondEmbed(crossAttnCond)
         let arguments = t[0..., .newAxis] * timestepFrequencies
@@ -289,7 +290,7 @@ final class StableAudio3DiT: Module {
         let input = preprocessConv(channelsLast) + channelsLast
         trace?("input", input)
         // Text-to-audio: no inpainting mask or masked input.
-        let local = MLXArray.zeros([x.dim(0), x.dim(-1), config.localAddCondDimension],
+        let local = localAddCond ?? MLXArray.zeros([x.dim(0), x.dim(-1), config.localAddCondDimension],
                                   dtype: computeInFloat16 ? .float16 : .float32)
         transformer.trace = trace
         let h = transformer(input, context: context, globalEmbed: globalEmbed, localAddCond: local)
@@ -330,6 +331,6 @@ final class StableAudio3DiT: Module {
 /// at arguments of thousands of radians.
 let nearestPi = Float(Double.pi)
 
-func rope(_ x: MLXArray, _ dimensions: Int) -> MLXArray {
-    MLXFast.RoPE(x, dimensions: dimensions, traditional: false, base: 10_000, scale: 1, offset: 0)
+func rope(_ x: MLXArray, _ dimensions: Int, offset: Int = 0) -> MLXArray {
+    MLXFast.RoPE(x, dimensions: dimensions, traditional: false, base: 10_000, scale: 1, offset: offset)
 }

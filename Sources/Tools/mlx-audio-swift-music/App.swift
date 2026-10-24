@@ -27,6 +27,9 @@ struct CLI {
     var cacheMB = 64
     var textCache: URL?
     var output: URL?
+    var initAudio: URL?
+    var initNoiseLevel: Float = 1
+    var initAudioOffset = 0.0
 
     static func parse(_ arguments: [String]) throws -> CLI {
         var cli = CLI()
@@ -43,13 +46,26 @@ struct CLI {
                 guard let variant = StableAudio3.Variant(rawValue: raw) else { throw CLIError.invalidValue(arg, raw) }
                 cli.variant = variant
             case "--prompt": cli.prompt = try value(arg)
+            case "--init-audio": cli.initAudio = URL(fileURLWithPath: try value(arg))
+            case "--init-noise-level":
+                let raw = try value(arg)
+                guard let level = Float(raw), level.isFinite, (0.01...1).contains(level) else {
+                    throw CLIError.invalidValue(arg, raw)
+                }
+                cli.initNoiseLevel = level
+            case "--init-audio-offset":
+                let raw = try value(arg)
+                guard let offset = Double(raw), offset.isFinite, offset >= 0 else {
+                    throw CLIError.invalidValue(arg, raw)
+                }
+                cli.initAudioOffset = offset
             case "--dit-precision":
                 let raw = try value(arg)
                 guard let precision = StableAudio3.DiTPrecision(rawValue: raw) else { throw CLIError.invalidValue(arg, raw) }
                 cli.precision = precision
             case "--seconds":
                 let raw = try value(arg)
-                guard let seconds = Double(raw), seconds > 0 else { throw CLIError.invalidValue(arg, raw) }
+                guard let seconds = Double(raw), seconds.isFinite, seconds > 0 else { throw CLIError.invalidValue(arg, raw) }
                 cli.seconds = seconds
             case "--seed":
                 let raw = try value(arg)
@@ -80,6 +96,7 @@ struct CLI {
         guard cli.weights != nil else { throw CLIError.missingValue("--weights") }
         guard cli.prompt != nil else { throw CLIError.missingValue("--prompt") }
         guard cli.output != nil else { throw CLIError.missingValue("--out") }
+        if cli.initAudioOffset != 0, cli.initAudio == nil { throw CLIError.missingValue("--init-audio") }
         return cli
     }
 
@@ -103,6 +120,9 @@ struct CLI {
               --duty-cycle <n>  GPU work fraction (0 < n <= 1); default 1, gentle 0.25
               --cache-mb <n>    Maximum reusable MLX cache in MiB; default 64
               --text-cache <dir>  Keep prompt embeddings here and reuse them
+              --init-audio <path> Regenerate a local audio file; requires the variant's FP32 encoder
+              --init-noise-level <n> Strength, 0.01...1 (default 1); higher keeps less source audio
+              --init-audio-offset <s> Start reading source audio at this offset (default 0)
               --out, -o <path>    Output WAV, 16-bit stereo 44.1 kHz
             """
         )
@@ -157,7 +177,8 @@ enum App {
             var writeError: Error?
             let audio = try model.generate(
                 .init(prompt: cli.prompt!, seconds: cli.seconds, seed: cli.seed, steps: cli.steps,
-                      precision: cli.precision),
+                      precision: cli.precision, initAudio: cli.initAudio,
+                      initNoiseLevel: cli.initNoiseLevel, initAudioOffset: cli.initAudioOffset),
                 progress: { stage in
                     // Loading models is disk and copying, not GPU work: resting three
                     // times as long after it (at duty 0.25) only held the memory longer.
@@ -170,6 +191,7 @@ enum App {
                     pacer.rest()
                     switch stage {
                     case .encodingText: print("text encoder")
+                    case .encodingAudio: print("audio encoder")
                     case .sampling(let step, let total): print("sample \(step)/\(total)")
                     case .decoding: print("decoder")
                     }

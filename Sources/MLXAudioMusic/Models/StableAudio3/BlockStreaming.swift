@@ -71,8 +71,10 @@ final class StableAudio3BlockStream {
 final class SAMELBlockStream {
     private let block = SAMELBlock(dimensions: SAMELDecoder.dimensions, sineGate: false)
     private let entries: NPZBlockEntries
+    private let sineGate: (Int) -> Bool
 
-    init(archive: NPZArchive) throws {
+    init(archive: NPZArchive, sineGate: @escaping (Int) -> Bool = SAMELDecoder.sineGate) throws {
+        self.sineGate = sineGate
         entries = try NPZBlockEntries(archive: archive, prefix: "blocks.", count: SAMELDecoder.depth)
         try StableAudio3Quantization.prepare(block, archive: archive, keys: entries.keys)
         try entries.validate(against: block)
@@ -81,7 +83,7 @@ final class SAMELBlockStream {
     /// The one block module, holding block `index`.
     func load(_ index: Int) -> SAMELBlock {
         block.update(parameters: entries.parameters(index, dtype: .float32))
-        block.ff.sineGate = SAMELDecoder.sineGate(block: index)
+        block.ff.sineGate = sineGate(index)
         return block
     }
 }

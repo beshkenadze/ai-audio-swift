@@ -13,6 +13,7 @@ func bitwiseEqual(_ a: MLXArray, _ b: MLXArray) -> Bool {
 
 /// Streaming blocks out of the archive changes where the weights live, not one bit of
 /// what the model computes. Untrained weights: only the plumbing is under test.
+@Suite(.serialized)
 struct StableAudio3StreamingTests {
     private func smallConfig(differential: Bool) -> StableAudio3DiTConfig {
         var config = StableAudio3DiTConfig.smallMusic
@@ -81,6 +82,21 @@ struct StableAudio3StreamingTests {
         #expect(arrayEqual(positive, negative).item(Bool.self))
         #expect(!bitwiseEqual(positive, negative))
         #expect(bitwiseEqual(positive, MLXArray([Float(0)])))
+    }
+
+    @Test func transformerUsesProvidedLocalConditioning() {
+        let model = StableAudio3DiT(smallConfig(differential: false))
+        let x = MLXArray.zeros([1, 256, 2])
+        let t = MLXArray([Float(0.6)])
+        let cross = MLXArray.zeros([1, 3, 768])
+        let global = MLXArray.zeros([1, 768])
+        let zeros = MLXArray.zeros([1, 2, 257])
+        let plain = model(x, t: t, crossAttnCond: cross, globalCond: global)
+        let explicit = model(x, t: t, crossAttnCond: cross, globalCond: global, localAddCond: zeros)
+        #expect(bitwiseEqual(plain, explicit))
+        let conditioned = model(x, t: t, crossAttnCond: cross, globalCond: global,
+                                localAddCond: MLXArray.ones([1, 2, 257]).asType(.float16))
+        #expect(abs(conditioned - plain).max().item(Float.self) > 1e-4)
     }
 
     @Test func textCacheKeyFollowsThePromptAndTheEncoderFile() throws {
