@@ -45,10 +45,13 @@ public struct StableAudio3 {
         public var initAudio: URL?
         public var initNoiseLevel: Float
         public var initAudioOffset: Double
+        public var initLatents: URL?
+        public var initLatentOffset: Int
 
         public init(prompt: String, seconds: Double, seed: UInt64, steps: Int = 8,
                     precision: DiTPrecision = .reference, initAudio: URL? = nil,
-                    initNoiseLevel: Float = 1, initAudioOffset: Double = 0) {
+                    initNoiseLevel: Float = 1, initAudioOffset: Double = 0,
+                    initLatents: URL? = nil, initLatentOffset: Int = 0) {
             self.prompt = prompt
             self.seconds = seconds
             self.seed = seed
@@ -57,6 +60,8 @@ public struct StableAudio3 {
             self.initAudio = initAudio
             self.initNoiseLevel = initNoiseLevel
             self.initAudioOffset = initAudioOffset
+            self.initLatents = initLatents
+            self.initLatentOffset = initLatentOffset
         }
     }
 
@@ -85,7 +90,8 @@ public struct StableAudio3 {
     ) throws -> MLXArray {
         guard request.seconds.isFinite, request.seconds > 0, request.steps > 0,
               request.initNoiseLevel.isFinite, (0.01...1).contains(request.initNoiseLevel),
-              request.initAudioOffset.isFinite, request.initAudioOffset >= 0 else {
+              request.initAudioOffset.isFinite, request.initAudioOffset >= 0,
+              request.initLatentOffset >= 0, request.initAudio == nil || request.initLatents == nil else {
             throw CocoaError(.validationMissingMandatoryProperty)
         }
         let latentLength = Self.latentLength(seconds: request.seconds)
@@ -94,17 +100,16 @@ public struct StableAudio3 {
         let (embeddings, mask) = try autoreleasedStage { try encodeText(request.prompt) }
 
         let initLatents: MLXArray?
-        if let audio = request.initAudio {
-            progress(.encodingAudio)
+        if let file = request.initLatents {
             initLatents = try autoreleasedStage {
-                let length = Self.encoderLatentLength(latentLength, variant: variant)
-                let input = try Self.loadInitAudio(audio, frames: length * Self.samplesPerLatent,
-                                                  offset: request.initAudioOffset)
-                let encoded = try Self.encodeAudio(Self.patch(input), weights: url(variant.encoderWeights),
-                                            variant: variant)[.ellipsis, ..<latentLength].asType(.float16)
+                let encoded = try LatentAudio(contentsOf: file)
+                    .segment(length: latentLength, offset: request.initLatentOffset, variant: variant)
                 eval(encoded)
                 return encoded
             }
+        } else if let audio = request.initAudio {
+            initLatents = try encodeAudioFile(audio, seconds: request.seconds, offset: request.initAudioOffset,
+                                              progress: progress).latents
         } else {
             initLatents = nil
         }

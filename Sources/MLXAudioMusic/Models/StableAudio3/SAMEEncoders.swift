@@ -72,7 +72,8 @@ final class SAMELEncoder: Module {
         _runningStd.wrappedValue = MLXArray.ones([1])
     }
 
-    func callAsFunction(_ patches: MLXArray, stream: SAMELBlockStream? = nil, chunk: Int? = 128) -> MLXArray {
+    func callAsFunction(_ patches: MLXArray, stream: SAMELBlockStream? = nil, chunk: Int? = 128,
+                        positionOffset: Int = 0) -> MLXArray {
         precondition(patches.dim(1) == 512 && patches.dim(2) % 16 == 0)
         precondition(stream != nil || blocks.count == 12)
         let (b, t, d) = (patches.dim(0), patches.dim(2) / 16, 1536)
@@ -95,7 +96,7 @@ final class SAMELEncoder: Module {
         for index in 0..<12 {
             let block = stream?.load(index) ?? blocks[index]
             for i in hidden.indices {
-                hidden[i] = block(hidden[i], band: band, offset: windows[i].left * 17)
+                hidden[i] = block(hidden[i], band: band, offset: (positionOffset + windows[i].left) * 17)
                 eval(hidden[i])
             }
         }

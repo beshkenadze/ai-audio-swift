@@ -30,6 +30,11 @@ struct CLI {
     var initAudio: URL?
     var initNoiseLevel: Float = 1
     var initAudioOffset = 0.0
+    var encodeOnly = false
+    var explicitSeconds = false
+    var initLatents: URL?
+    var initLatentOffset = 0
+    var latentOffsetSeconds: Double?
 
     static func parse(_ arguments: [String]) throws -> CLI {
         var cli = CLI()
@@ -47,6 +52,16 @@ struct CLI {
                 cli.variant = variant
             case "--prompt": cli.prompt = try value(arg)
             case "--init-audio": cli.initAudio = URL(fileURLWithPath: try value(arg))
+            case "--encode-only": cli.encodeOnly = true
+            case "--init-latents": cli.initLatents = URL(fileURLWithPath: try value(arg))
+            case "--init-latents-offset":
+                let raw = try value(arg)
+                guard let offset = Int(raw), offset >= 0 else { throw CLIError.invalidValue(arg, raw) }
+                cli.initLatentOffset = offset
+            case "--init-latents-offset-seconds":
+                let raw = try value(arg)
+                guard let offset = Double(raw), offset.isFinite, offset >= 0 else { throw CLIError.invalidValue(arg, raw) }
+                cli.latentOffsetSeconds = offset
             case "--init-noise-level":
                 let raw = try value(arg)
                 guard let level = Float(raw), level.isFinite, (0.01...1).contains(level) else {
@@ -67,6 +82,7 @@ struct CLI {
                 let raw = try value(arg)
                 guard let seconds = Double(raw), seconds.isFinite, seconds > 0 else { throw CLIError.invalidValue(arg, raw) }
                 cli.seconds = seconds
+                cli.explicitSeconds = true
             case "--seed":
                 let raw = try value(arg)
                 guard let seed = UInt64(raw) else { throw CLIError.invalidValue(arg, raw) }
@@ -94,9 +110,19 @@ struct CLI {
             }
         }
         guard cli.weights != nil else { throw CLIError.missingValue("--weights") }
-        guard cli.prompt != nil else { throw CLIError.missingValue("--prompt") }
+        guard cli.encodeOnly || cli.prompt != nil else { throw CLIError.missingValue("--prompt") }
         guard cli.output != nil else { throw CLIError.missingValue("--out") }
         if cli.initAudioOffset != 0, cli.initAudio == nil { throw CLIError.missingValue("--init-audio") }
+        if cli.initAudio != nil, cli.initLatents != nil { throw CLIError.invalidValue("--init-latents", "cannot combine with --init-audio") }
+        if cli.encodeOnly, cli.initAudio == nil { throw CLIError.missingValue("--init-audio") }
+        if cli.encodeOnly, cli.output?.pathExtension != "safetensors" { throw CLIError.invalidValue("--out", "encode-only requires .safetensors") }
+        if cli.initLatentOffset != 0 || cli.latentOffsetSeconds != nil {
+            guard cli.initLatents != nil else { throw CLIError.missingValue("--init-latents") }
+        }
+        if let seconds = cli.latentOffsetSeconds {
+            guard cli.initLatentOffset == 0 else { throw CLIError.invalidValue("--init-latents-offset", "use only one offset unit") }
+            cli.initLatentOffset = try StableAudio3.latentOffset(seconds: seconds)
+        }
         return cli
     }
 
@@ -123,6 +149,11 @@ struct CLI {
               --init-audio <path> Regenerate a local audio file; requires the variant's FP32 encoder
               --init-noise-level <n> Strength, 0.01...1 (default 1); higher keeps less source audio
               --init-audio-offset <s> Start reading source audio at this offset (default 0)
+              --encode-only      Encode --init-audio to --out <file.safetensors>; no prompt/DiT/decoder
+                                 Encodes the whole file unless --seconds is supplied
+              --init-latents <path> Generate from saved latents without loading an audio encoder
+              --init-latents-offset <n> Start at latent position n (default 0)
+              --init-latents-offset-seconds <s> Start at nearest latent position, ties to even
               --out, -o <path>    Output WAV, 16-bit stereo 44.1 kHz
             """
         )
@@ -172,13 +203,29 @@ enum App {
             let model = StableAudio3(variant: cli.variant, weightsDirectory: cli.weights!,
                                      textCacheDirectory: cli.textCache)
             let started = Date()
+            if cli.encodeOnly {
+                let bank = try model.encodeAudioFile(cli.initAudio!, seconds: cli.explicitSeconds ? cli.seconds : nil,
+                                                     offset: cli.initAudioOffset) { _ in
+                    print("audio encoder")
+                    fflush(nil)
+                }
+                try bank.save(to: cli.output!)
+                let metadata: [String: Any] = ["schema": 1, "variant": cli.variant.rawValue,
+                                                "samples": bank.sampleCount, "length": bank.latents.dim(2)]
+                let json = try JSONSerialization.data(withJSONObject: metadata, options: .sortedKeys)
+                print("latents " + String(decoding: json, as: UTF8.self))
+                print(String(format: "encoded %.3fs audio  %d latents  %.2fs wall", bank.seconds,
+                             bank.latents.dim(2), Date().timeIntervalSince(started)))
+                return
+            }
             let writer = try WAVWriter(url: cli.output!, channels: 2, sampleRate: StableAudio3.sampleRate,
                                        frames: StableAudio3.sampleCount(seconds: cli.seconds))
             var writeError: Error?
             let audio = try model.generate(
                 .init(prompt: cli.prompt!, seconds: cli.seconds, seed: cli.seed, steps: cli.steps,
                       precision: cli.precision, initAudio: cli.initAudio,
-                      initNoiseLevel: cli.initNoiseLevel, initAudioOffset: cli.initAudioOffset),
+                      initNoiseLevel: cli.initNoiseLevel, initAudioOffset: cli.initAudioOffset,
+                      initLatents: cli.initLatents, initLatentOffset: cli.initLatentOffset),
                 progress: { stage in
                     // Loading models is disk and copying, not GPU work: resting three
                     // times as long after it (at duty 0.25) only held the memory longer.
