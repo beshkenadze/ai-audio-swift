@@ -35,6 +35,11 @@ struct CLI {
     var initLatents: URL?
     var initLatentOffset = 0
     var latentOffsetSeconds: Double?
+    var saveLatents: URL?
+    var refLatents: URL?
+    var refSeconds = 10.0
+    var refEnd: Double?
+    var refNoiseSeed: UInt64?
 
     static func parse(_ arguments: [String]) throws -> CLI {
         var cli = CLI()
@@ -102,6 +107,20 @@ struct CLI {
                 guard let mb = Int(raw), (0...1024).contains(mb) else { throw CLIError.invalidValue(arg, raw) }
                 cli.cacheMB = mb
             case "--text-cache": cli.textCache = URL(fileURLWithPath: try value(arg), isDirectory: true)
+            case "--save-latents": cli.saveLatents = URL(fileURLWithPath: try value(arg))
+            case "--ref-latents": cli.refLatents = URL(fileURLWithPath: try value(arg))
+            case "--ref-seconds":
+                let raw = try value(arg)
+                guard let seconds = Double(raw), seconds.isFinite, seconds > 0 else { throw CLIError.invalidValue(arg, raw) }
+                cli.refSeconds = seconds
+            case "--ref-end":
+                let raw = try value(arg)
+                guard let seconds = Double(raw), seconds.isFinite, seconds > 0 else { throw CLIError.invalidValue(arg, raw) }
+                cli.refEnd = seconds
+            case "--ref-noise-seed":
+                let raw = try value(arg)
+                guard let seed = UInt64(raw) else { throw CLIError.invalidValue(arg, raw) }
+                cli.refNoiseSeed = seed
             case "--out", "-o": cli.output = URL(fileURLWithPath: try value(arg))
             case "--help", "-h":
                 printUsage()
@@ -115,6 +134,12 @@ struct CLI {
         if cli.initAudioOffset != 0, cli.initAudio == nil { throw CLIError.missingValue("--init-audio") }
         if cli.initAudio != nil, cli.initLatents != nil { throw CLIError.invalidValue("--init-latents", "cannot combine with --init-audio") }
         if cli.encodeOnly, cli.initAudio == nil { throw CLIError.missingValue("--init-audio") }
+        if cli.refLatents != nil, cli.initAudio != nil || cli.initLatents != nil {
+            throw CLIError.invalidValue("--ref-latents", "cannot combine with --init-audio or --init-latents")
+        }
+        if cli.refLatents == nil, cli.refEnd != nil || cli.refNoiseSeed != nil {
+            throw CLIError.missingValue("--ref-latents")
+        }
         if cli.encodeOnly, cli.output?.pathExtension != "safetensors" { throw CLIError.invalidValue("--out", "encode-only requires .safetensors") }
         if cli.initLatentOffset != 0 || cli.latentOffsetSeconds != nil {
             guard cli.initLatents != nil else { throw CLIError.missingValue("--init-latents") }
@@ -154,6 +179,12 @@ struct CLI {
               --init-latents <path> Generate from saved latents without loading an audio encoder
               --init-latents-offset <n> Start at latent position n (default 0)
               --init-latents-offset-seconds <s> Start at nearest latent position, ties to even
+              --save-latents <f>  Write the sampled latents (.safetensors, as --init-latents reads them) before decoding
+              --ref-latents <f>   Continue earlier audio: pin the end of these saved latents at the start of
+                                  the sequence. --seconds is then the whole sequence, reference included
+              --ref-seconds <s>   Length of the reference. Default: 10
+              --ref-end <s>       Where the reference ends in the saved latents. Default: their end
+              --ref-noise-seed <n>  Seed of the noise the reference starts from. Default: --seed + 1000003
               --out, -o <path>    Output WAV, 16-bit stereo 44.1 kHz
             """
         )
@@ -218,6 +249,10 @@ enum App {
                              bank.latents.dim(2), Date().timeIntervalSince(started)))
                 return
             }
+            let reference = try cli.refLatents.map {
+                try StableAudio3.LatentAudio(contentsOf: $0).reference(
+                    seconds: cli.refSeconds, end: cli.refEnd, noiseSeed: cli.refNoiseSeed ?? cli.seed &+ 1_000_003)
+            }
             let writer = try WAVWriter(url: cli.output!, channels: 2, sampleRate: StableAudio3.sampleRate,
                                        frames: StableAudio3.sampleCount(seconds: cli.seconds))
             var writeError: Error?
@@ -225,7 +260,7 @@ enum App {
                 .init(prompt: cli.prompt!, seconds: cli.seconds, seed: cli.seed, steps: cli.steps,
                       precision: cli.precision, initAudio: cli.initAudio,
                       initNoiseLevel: cli.initNoiseLevel, initAudioOffset: cli.initAudioOffset,
-                      initLatents: cli.initLatents, initLatentOffset: cli.initLatentOffset),
+                      initLatents: cli.initLatents, initLatentOffset: cli.initLatentOffset, reference: reference),
                 progress: { stage in
                     // Loading models is disk and copying, not GPU work: resting three
                     // times as long after it (at duty 0.25) only held the memory longer.
@@ -248,7 +283,8 @@ enum App {
                     guard writeError == nil else { return }
                     do { try writer.append(piece) } catch { writeError = error }
                     pacer.rest()
-                })
+                },
+                onLatents: cli.saveLatents.map { url in { try $0.save(to: url) } })
             if let writeError { throw writeError }
             try writer.close()
             let wall = Date().timeIntervalSince(started)

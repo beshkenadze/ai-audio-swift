@@ -38,6 +38,7 @@ public struct StableAudio3 {
 
     public struct Request: Sendable {
         public var prompt: String
+        /// The whole sequence, reference included; it is also the duration the model is told.
         public var seconds: Double
         public var seed: UInt64
         public var steps: Int
@@ -47,11 +48,12 @@ public struct StableAudio3 {
         public var initAudioOffset: Double
         public var initLatents: URL?
         public var initLatentOffset: Int
+        public var reference: Reference?
 
         public init(prompt: String, seconds: Double, seed: UInt64, steps: Int = 8,
                     precision: DiTPrecision = .reference, initAudio: URL? = nil,
                     initNoiseLevel: Float = 1, initAudioOffset: Double = 0,
-                    initLatents: URL? = nil, initLatentOffset: Int = 0) {
+                    initLatents: URL? = nil, initLatentOffset: Int = 0, reference: Reference? = nil) {
             self.prompt = prompt
             self.seconds = seconds
             self.seed = seed
@@ -62,6 +64,7 @@ public struct StableAudio3 {
             self.initAudioOffset = initAudioOffset
             self.initLatents = initLatents
             self.initLatentOffset = initLatentOffset
+            self.reference = reference
         }
     }
 
@@ -85,16 +88,22 @@ public struct StableAudio3 {
     ///
     /// `onAudio` receives the audio in order as the decoder produces it, so a caller can
     /// write or play the start before decoding ends; the pieces concatenate to the result.
+    /// `onLatents` receives the sampled latents before they are decoded.
     public func generate(
-        _ request: Request, progress: (Stage) -> Void = { _ in }, onAudio: (MLXArray) -> Void = { _ in }
+        _ request: Request, progress: (Stage) -> Void = { _ in }, onAudio: (MLXArray) -> Void = { _ in },
+        onLatents: ((LatentAudio) throws -> Void)? = nil
     ) throws -> MLXArray {
         guard request.seconds.isFinite, request.seconds > 0, request.steps > 0,
               request.initNoiseLevel.isFinite, (0.01...1).contains(request.initNoiseLevel),
               request.initAudioOffset.isFinite, request.initAudioOffset >= 0,
-              request.initLatentOffset >= 0, request.initAudio == nil || request.initLatents == nil else {
+              request.initLatentOffset >= 0, request.initAudio == nil || request.initLatents == nil,
+              request.reference == nil || (request.initAudio == nil && request.initLatents == nil) else {
             throw CocoaError(.validationMissingMandatoryProperty)
         }
         let latentLength = Self.latentLength(seconds: request.seconds)
+        let pin = try request.reference.map {
+            try Pin($0, channels: variant.ditConfig.ioChannels, sequenceLength: latentLength)
+        }
 
         progress(.encodingText)
         let (embeddings, mask) = try autoreleasedStage { try encodeText(request.prompt) }
@@ -127,12 +136,15 @@ public struct StableAudio3 {
             progress(.sampling(step: 0, of: request.steps))
             let latents = Self.sample(
                 noise: noise, sigmas: Self.schedule(steps: request.steps, sigmaMax: request.initNoiseLevel), seed: request.seed + 1,
+                pin: pin,
                 velocity: { model($0, t: $1, crossAttnCond: conditioning.crossAttn,
                                   globalCond: conditioning.global) },
                 onStep: { progress(.sampling(step: $0, of: request.steps)) })
             eval(latents)
             return latents
         }
+        try onLatents?(LatentAudio(latents: latents.asType(.float16), variant: variant,
+                                   sampleCount: Self.sampleCount(seconds: request.seconds)))
 
         progress(.decoding)
         return try autoreleasedStage {
@@ -356,9 +368,10 @@ public struct StableAudio3 {
     }
 
     /// Ping-pong sampler for a rectified-flow velocity model: denoise fully, then
-    /// re-noise to the next level with fresh noise.
+    /// re-noise to the next level with fresh noise. With a `pin`, the head is reset to the
+    /// reference at the level of each evaluation, including after the re-noising.
     static func sample(
-        noise: MLXArray, sigmas: MLXArray, seed: UInt64,
+        noise: MLXArray, sigmas: MLXArray, seed: UInt64, pin: Pin? = nil,
         velocity: (MLXArray, MLXArray) -> MLXArray,
         onStep: (Int) -> Void = { _ in }
     ) -> MLXArray {
@@ -368,6 +381,7 @@ public struct StableAudio3 {
         for i in 0..<steps {
             let current = sigmas[i]
             let next = sigmas[i + 1]
+            if let pin { x = pin.apply(to: x, sigma: current) }
             let t = current * MLXArray.ones([x.dim(0)], dtype: x.dtype)
             let denoised = x - current.asType(x.dtype) * velocity(x, t)
             if i < steps - 1, next.item(Float.self) > 0 {
@@ -381,6 +395,7 @@ public struct StableAudio3 {
             eval(x)
             onStep(i + 1)
         }
+        if let pin { x = pin.apply(to: x, sigma: MLXArray(Float(0))) }
         return x
     }
 
